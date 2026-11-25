@@ -17,10 +17,9 @@ pub enum ToastKind {
     Info,
 }
 
-/// Toast: a white rounded card 32px below the top, centred, with a filled
-/// status circle (green check / red x / accent i). It lasts 3s and fades over
+/// Toast: `design::Toast` 32px below the top, centred. It lasts 3s and fades over
 /// its last .3s; None once it is over.
-pub fn toast_el(kind: ToastKind, msg: &SharedString, t0: std::time::Instant, window: &mut Window) -> Option<AnyElement> {
+pub fn toast_el(kind: ToastKind, msg: &SharedString, t0: web_time::Instant, window: &mut Window) -> Option<AnyElement> {
     let e = t0.elapsed().as_secs_f32();
     if e >= 3. {
         return None;
@@ -31,39 +30,13 @@ pub fn toast_el(kind: ToastKind, msg: &SharedString, t0: std::time::Instant, win
     } else {
         1.
     };
-    let (fill, mark, mark_size) = match kind {
-        ToastKind::Success => (theme::c(craft::old::G500), "check", 10.),
-        ToastKind::Error => (Theme::danger(), "x", 10.),
-        ToastKind::Info => (Theme::primary(), "info-mark", 12.),
+    let tone = match kind {
+        ToastKind::Success => crate::design::ToastTone::Success,
+        ToastKind::Error => crate::design::ToastTone::Error,
+        ToastKind::Info => crate::design::ToastTone::Info,
     };
     let vw = window.viewport_size().width;
-    let card = div()
-        .flex()
-        .items_center()
-        .px(px(14.))
-        .py(px(10.))
-        .rounded(px(12.))
-        .bg(crate::theme::raised(Theme::bg_body()))
-        .border_1()
-        .border_color(Theme::line_border())
-        .shadow(theme::shadow_panel())
-        .font_family(theme::UI_FONT)
-        .text_size(px(13.))
-        .line_height(px(20.))
-        .text_color(Theme::text())
-        .child(
-            div()
-                .relative()
-                .size(px(16.))
-                .mr(px(8.))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(icon("circle-filled", 16., fill).absolute().top_0().left_0())
-                .child(icon(mark, mark_size, gpui::white())),
-        )
-        .child(ui_text(crate::settings::label(msg)));
+    let card = crate::design::Toast::new(tone, crate::settings::label(msg));
     Some(
         deferred(
             anchored()
@@ -76,31 +49,7 @@ pub fn toast_el(kind: ToastKind, msg: &SharedString, t0: std::time::Instant, win
     )
 }
 
-/// Popover shell shared by the slash menu, block menu and toolbar dropdowns:
-/// the light panel (macOS 26 menu material, near-white), hairline,
-/// radius 12, soft drop.
-pub fn popover() -> Div {
-    div()
-        .bg(crate::theme::raised(Theme::popover_bg()))
-        .border_1()
-        .border_color(Theme::line_border())
-        .rounded(px(MENU_RADIUS))
-        .shadow(theme::shadow_menu())
-        .font_family(theme::UI_FONT)
-        .text_color(Theme::text())
-}
 
-/// Second-level panels (color panel, link editor): white, larger drop.
-/// The header button: a white pill on the note (hairline, 1px drop, radius 12).
-pub fn pill() -> Div {
-    div()
-        .flex_none()
-        .rounded(px(12.))
-        .bg(crate::theme::raised(Theme::bg_body()))
-        .border_1()
-        .border_color(Theme::button_border())
-        .shadow(theme::shadow_button())
-}
 
 /// Column headers of the page lists: tertiary text (measured #88898B on
 /// the name / last-viewed / created columns).
@@ -113,22 +62,21 @@ pub fn list_line() -> Hsla {
     theme::ca(craft::N1000, 0.045)
 }
 
-/// The quiet list hover: a rounded fill that also hides the row's
-/// hairline above it.
+/// The quiet list hover: a rounded fill that hides the row's own hairline
+/// at once (the one below follows `Home::list_hover`, see [`row_line`]).
 pub fn row_hover(s: StyleRefinement) -> StyleRefinement {
     s.bg(Theme::fill_hover()).border_color(transparent_black()).rounded(px(ROW_RADIUS))
 }
 
-
-/// The window dimmed under a modal dialog: a light black veil.
-pub fn scrim() -> Hsla {
-    theme::ca(craft::N1000, 0.25)
+/// A list hairline (the header's foot, or the line above a row), hidden
+/// when a row it touches is lit (hovered, or holding its menu): a lit
+/// row's rounded fill would otherwise leave the line's ends at its corners.
+pub fn row_line(touches_lit: bool) -> Hsla {
+    if touches_lit { transparent_black() } else { list_line() }
 }
 
-/// The modal dialog: white, radius 16, deep soft drop.
-pub fn dialog(id: &'static str) -> Stateful<Div> {
-    div().id(id).occlude().rounded(px(16.)).bg(crate::theme::raised(Theme::bg_body())).shadow(theme::shadow_dialog()).font_family(theme::UI_FONT).text_color(Theme::text())
-}
+
+
 
 /// A busy mark for a button: three short bars rising and falling in turn,
 /// for `t` seconds since it started. The caller asks for frames while it shows.
@@ -141,111 +89,14 @@ pub fn spinner(t: f32, color: Hsla) -> Div {
     bars
 }
 
-/// The primary button: the accent, a white 13pt semibold label, 30 tall, radius 9.
-pub fn primary_button(id: &'static str, label: &'static str) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex_none()
-        .h(px(30.))
-        .px(px(16.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(9.))
-        .cursor_pointer()
-        .bg(Theme::primary())
-        .shadow(theme::shadow_button())
-        .hover(|s| s.bg(theme::c(craft::B600)))
-        .active(|s| s.bg(theme::c(craft::B700)))
-        .text_size(px(13.))
-        .line_height(px(20.))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(gpui::white())
-        .child(crate::settings::label(label))
-}
 
-/// The secondary button: white with a hairline and a 1px drop, 30 tall, radius 9.
-pub fn secondary_button(id: &'static str, label: &'static str) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex_none()
-        .h(px(30.))
-        .px(px(16.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(9.))
-        .cursor_pointer()
-        .bg(crate::theme::raised(Theme::bg_body()))
-        .border_1()
-        .border_color(Theme::button_border())
-        .shadow(theme::shadow_button())
-        .hover(|s| s.bg(theme::c(craft::N100)))
-        .active(|s| s.bg(theme::c(craft::N200)))
-        .text_size(px(13.))
-        .line_height(px(20.))
-        .text_color(Theme::text())
-        .child(crate::settings::label(label))
-}
 
-/// The panel close button: a grey disc with a white cross (measured
-/// #B6B7B8 on #F7F7F7, black at about 26%).
-pub fn close_button(id: &'static str) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex_none()
-        .size(px(18.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .cursor_pointer()
-        .bg(theme::ca(craft::N1000, 0.26))
-        .hover(|s| s.bg(theme::ca(craft::N1000, 0.36)))
-        .child(icon("x", 16., gpui::white()))
-}
 
-/// Menus and popovers round at 12 (the native menu panel); their
-/// rows at 6, 5pt in from the edge.
-pub const MENU_RADIUS: f32 = 12.;
+/// A list row's corners under the pointer (主页, 回收站).
 pub const ROW_RADIUS: f32 = 6.;
 
-/// A menu row: 32 tall, 13pt label, 16pt glyph; hovering lays the quiet
-/// fill the editor's menus use, and text and glyph keep their colours.
-pub const MENU_ROW_H: f32 = 32.;
-pub const MENU_PAD_Y: f32 = 6.;
-/// How far a menu row sits in from the menu's sides.
-pub const MENU_INSET: f32 = 5.;
 
-pub fn menu_row(id: impl Into<ElementId>, group: SharedString) -> Stateful<Div> {
-    div()
-        .id(id)
-        .group(group)
-        .flex_none()
-        .h(px(MENU_ROW_H))
-        .mx(px(MENU_INSET))
-        .px(px(8.))
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .rounded(px(ROW_RADIUS))
-        .cursor_pointer()
-        .text_size(px(13.))
-        .line_height(px(20.))
-        .text_color(Theme::text())
-        .hover(|s| s.bg(Theme::fill_hover()))
-}
-
-/// A [`menu_row`]'s label; it keeps its colour on hover (the row's fill
-/// shows it). `_group` and `_hover` are left from the accent highlight.
-pub fn menu_label(label: impl Into<SharedString>, _group: SharedString, _hover: Hsla) -> Div {
-    div().whitespace_nowrap().child(crate::settings::label(label.into()))
-}
-
-/// Glyph of a [`menu_row`]: secondary, on hover too.
-pub fn menu_glyph(name: &str, size: f32, _group: SharedString) -> Svg { icon(name, size, Theme::icon()) }
-
-/// Tooltip bubble: the dark rounded tip (12pt white on near-black, radius 7, arrow).
+/// Tooltip bubble: shadcn's tooltip (`tip_bg`) with an arrow.
 pub struct Tooltip {
     /// One or more lines.
     label: SharedString,
@@ -254,6 +105,11 @@ pub struct Tooltip {
     /// Where GPUI anchors the tooltip root (mouse + 1 at show time).
     origin: Point<Pixels>,
     side: TipSide,
+}
+
+thread_local! {
+    /// The trigger last pressed (its bounds), whose tooltip stays hidden until the pointer leaves it.
+    static TIP_PRESSED: std::cell::Cell<Option<Bounds<Pixels>>> = const { std::cell::Cell::new(None) };
 }
 
 /// Preferred side: chrome shows tooltips below, document controls above,
@@ -265,26 +121,29 @@ pub enum TipSide {
     Right,
 }
 
-const TIP_GAP: f32 = 8.;
+/// Radix's offset with shadcn's 10pt arrow (`size-2.5`, sticking out 5).
+const TIP_GAP: f32 = 10.;
 const TIP_ARROW: f32 = 5.;
-const TIP_PAD: f32 = 12.;
-const TIP_LINE: f32 = 18.;
-const TIP_BG: u32 = 0x2a2c2f;
-/// Tooltips stay dark in both looks (a step lighter on the dark page).
-fn tip_bg() -> Hsla { if theme::dark() { theme::rgbaf(0x3a, 0x3b, 0x3d, 1.) } else { theme::rgbaf((TIP_BG >> 16) as u8, (TIP_BG >> 8) as u8, TIP_BG as u8, 1.) } }
+const TIP_PAD: f32 = 2. * crate::design::G.tip_py;
+const TIP_LINE: f32 = 16.;
+/// shadcn's tooltip: `foreground` under `background` text (inverted in the dark), `rounded-md`,
+/// px-3 py-1.5, text-xs.
+fn tip_bg() -> Hsla { crate::design::color::foreground() }
 
 impl Render for Tooltip {
     fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        if self.anchor.is_some() && TIP_PRESSED.get() == self.anchor { return div().into_any_element(); }
         let lines: Vec<SharedString> = self.label.split('\n').map(|l| SharedString::from(l.to_string())).collect();
+        let g = crate::design::geo();
         let bubble = div()
-            .px(px(10.))
-            .py(px(6.))
-            .rounded(px(7.))
+            .px(px(g.tip_px))
+            .py(px(g.tip_py))
+            .rounded(px(g.tip_r))
             .bg(tip_bg())
-            .text_color(gpui::white())
-            .text_size(px(12.))
+            .text_color(crate::design::color::background())
+            .text_size(px(g.text_xs))
             .line_height(px(TIP_LINE))
-            .font_family(theme::UI_FONT)
+            .font_family(theme::ui_family())
             .whitespace_nowrap()
             .flex()
             .flex_col()
@@ -295,7 +154,7 @@ impl Render for Tooltip {
         // 10px from the trigger with an arrow pointing at it, on the preferred
         // side unless it doesn't fit, and kept inside the window.
         let mut style = window.text_style();
-        style.font_family = theme::UI_FONT.into();
+        style.font_family = theme::ui_family().into();
         let text_w = lines
             .iter()
             .map(|l| {
@@ -303,7 +162,7 @@ impl Render for Tooltip {
                 window.text_system().shape_line(l.clone(), px(12.), &runs, None).width
             })
             .fold(px(0.), |a, b| a.max(b));
-        let w = text_w + px(20.);
+        let w = text_w + px(2. * g.tip_px);
         let h = px(TIP_PAD + TIP_LINE * lines.len() as f32);
         let vp = window.viewport_size();
         let gap = px(TIP_GAP);
@@ -469,7 +328,18 @@ impl TipExt for Stateful<Div> {
         let bounds = Rc::new(std::cell::Cell::new(None::<Bounds<Pixels>>));
         let record = bounds.clone();
         let label = SharedString::from(label);
-        self.child(canvas(move |b, _, _| record.set(Some(b)), |_, _, _, _| {}).absolute().inset_0()).tooltip(move |window, cx| {
+        // Radix closes a trigger's tooltip on pointerdown and keeps it closed until the pointer
+        // leaves, so a menu opened by the press isn't covered by it. GPUI only drops it on the
+        // press and shows it again on the next move: `TIP_PRESSED` holds it back until the pointer
+        // is out. The element is rebuilt every frame, so the press is kept by the trigger's bounds.
+        let press = bounds.clone();
+        self.child(canvas(move |b, window, _| {
+            record.set(Some(b));
+            if TIP_PRESSED.get() == Some(b) && !b.contains(&window.mouse_position()) { TIP_PRESSED.set(None); }
+        }, |_, _, _, _| {}).absolute().inset_0())
+            .capture_any_mouse_down(move |_, _, _| TIP_PRESSED.set(press.get()))
+            // shadcn's TooltipProvider: `delayDuration = 0`
+            .tooltip_show_delay(std::time::Duration::ZERO).tooltip(move |window, cx| {
             let origin = window.mouse_position() + point(px(1.), px(1.));
             let (label, anchor) = (label.clone(), bounds.get());
             cx.new(|_| Tooltip { label, anchor, origin, side }).into()
@@ -555,10 +425,23 @@ pub fn is_cjk_punct(ch: char) -> bool {
         | '\u{FF01}'..='\u{FF0F}' | '\u{FF1A}'..='\u{FF20}' | '\u{FF3B}'..='\u{FF40}' | '\u{FF5B}'..='\u{FF65}')
 }
 
-/// Font for full-width punctuation. When CoreText falls back from the
-/// system UI font it squeezes these (an opening paren after a CJK
-/// character loses ~5px). Browsers draw them full width with PingFang SC.
+/// Font for full-width punctuation, and curly quotes in Chinese text. When
+/// CoreText falls back from the system UI font it squeezes these (an opening
+/// paren after a CJK character loses ~5px). Browsers draw them full width
+/// with PingFang SC. Each system's own Chinese sans, which has bold: a
+/// missing family would draw every weight and style in one regular face
+/// (`cjk_punct_font`).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub const CJK_PUNCT_FONT: &str = "PingFang SC";
+#[cfg(target_os = "windows")]
+pub const CJK_PUNCT_FONT: &str = "Microsoft YaHei";
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
+pub const CJK_PUNCT_FONT: &str = "Noto Sans CJK SC";
+
+/// `CJK_PUNCT_FONT`, unless this system was found not to have it
+/// (`fonts::check_cjk_punct`): then that text keeps its own family, as
+/// before there was one.
+pub fn cjk_punct_font() -> Option<&'static str> { crate::fonts::cjk_punct_installed().then_some(CJK_PUNCT_FONT) }
 
 /// Single-line UI text that keeps full-width punctuation at full width,
 /// with an optional colored range (search hits). Inherits the parent text
@@ -612,8 +495,8 @@ pub fn ui_runs(text: &str, style: &TextStyle, hits: &[std::ops::Range<usize>], h
     cuts.windows(2)
         .map(|w| {
             let mut run = style.to_run(w[1] - w[0]);
-            if text[w[0]..w[1]].chars().all(is_cjk_punct) {
-                run.font.family = CJK_PUNCT_FONT.into();
+            if text[w[0]..w[1]].chars().all(is_cjk_punct) && !crate::fonts::own_glyphs(&run.font.family).cjk_punct && let Some(f) = cjk_punct_font() {
+                run.font.family = f.into();
             }
             if hits.iter().any(|r| r.start <= w[0] && w[1] <= r.end) {
                 run.color = hit_color;
@@ -629,7 +512,7 @@ fn truncated(line: &ShapedLine, runs: &[TextRun], suffix: &str, font_size: Pixel
     let mut suffix_runs: Vec<TextRun> = runs.last().cloned().into_iter().collect();
     if let Some(r) = suffix_runs.first_mut() {
         r.len = suffix.len();
-        r.font.family = theme::UI_FONT.into();
+        r.font.family = theme::ui_family().into();
     }
     let suffix_w = window.text_system().shape_line(suffix.to_string().into(), font_size, &suffix_runs, None).width;
     let mut cut = 0;
@@ -656,13 +539,6 @@ fn truncated(line: &ShapedLine, runs: &[TextRun], suffix: &str, font_size: Pixel
     window.text_system().shape_line(s, font_size, &out, None)
 }
 
-impl IntoElement for UiText {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
 impl Element for UiText {
     type RequestLayoutState = UiTextLayout;
     type PrepaintState = Option<ShapedLine>;
@@ -686,7 +562,7 @@ impl Element for UiText {
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = style.line_height.to_pixels(font_size.into(), window.rem_size());
         let runs = if self.text.is_empty() { vec![] } else { self.runs(&style) };
-        let ellipsis = style.text_overflow.as_ref().map(|TextOverflow::Truncate(s)| s.clone());
+        let ellipsis = style.text_overflow.as_ref().map(|(TextOverflow::Truncate(s) | TextOverflow::TruncateStart(s) | TextOverflow::TruncateMiddle(s))| s.clone());
         let full = Rc::new(RefCell::new(None));
         let (text, r, f, clip) = (self.text.clone(), runs.clone(), full.clone(), ellipsis.is_some());
         let id = window.request_measured_layout(Style::default(), move |known, avail, window, _| {
@@ -736,7 +612,7 @@ impl Element for UiText {
         cx: &mut App,
     ) {
         if let Some(line) = line {
-            let _ = line.paint(bounds.origin, layout.line_height, window, cx);
+            let _ = line.paint(bounds.origin, layout.line_height, TextAlign::Left, None, window, cx);
         }
     }
 }
@@ -750,13 +626,6 @@ pub fn ui_para(text: impl Into<SharedString>) -> UiPara {
 pub struct UiPara {
     text: SharedString,
     inner: Option<StyledText>,
-}
-
-impl IntoElement for UiPara {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
 }
 
 impl Element for UiPara {
@@ -821,7 +690,7 @@ fn squircle_points(b: Bounds<Pixels>, radius: f32, i: f32) -> Vec<Point<Pixels>>
     let r = (radius - i).max(0.).min(w / 2.).min(h / 2.);
     const N: usize = 24;
     let mut out = Vec::with_capacity(4 * (N + 1));
-    // Corner centres with the directions to the corner's start and end edges.
+    // Anchor centres with the directions to the corner's start and end edges.
     for (cx, cy, ax, ay, bx, by) in [(x + w - r, y + r, 0., -1., 1., 0.), (x + w - r, y + h - r, 1., 0., 0., 1.), (x + r, y + h - r, 0., 1., -1., 0.), (x + r, y + r, -1., 0., 0., -1.)] {
         for k in 0..=N {
             let t = std::f32::consts::FRAC_PI_2 * k as f32 / N as f32;
@@ -832,7 +701,7 @@ fn squircle_points(b: Bounds<Pixels>, radius: f32, i: f32) -> Vec<Point<Pixels>>
     out
 }
 
-pub(crate) fn squircle_path(b: Bounds<Pixels>, radius: f32, i: f32, mut pb: PathBuilder) -> Option<Path<Pixels>> {
+pub(crate) fn squircle_path(b: Bounds<Pixels>, radius: f32, i: f32, mut pb: PathBuilder) -> Option<Path> {
     // lyon panics on a collapsed outline (a box not laid out yet).
     if f32::from(b.size.width) <= 2. * i + 1. || f32::from(b.size.height) <= 2. * i + 1. || radius <= i { return None }
     let pts = squircle_points(b, radius, i);
@@ -859,8 +728,8 @@ pub fn squircle_outline(radius: f32, width: f32, color: Hsla) -> impl IntoElemen
 /// A capsule filled to `fraction` from the left, its edge a moving wave (the
 /// update pill's download progress). Redraws every frame while shown.
 pub fn wave_fill(fraction: f32, color: Hsla) -> impl IntoElement {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let t = START.get_or_init(std::time::Instant::now).elapsed().as_secs_f32();
+    static START: std::sync::OnceLock<web_time::Instant> = std::sync::OnceLock::new();
+    let t = START.get_or_init(web_time::Instant::now).elapsed().as_secs_f32();
     canvas(|bounds, _, _| bounds, move |_, b, window, _| {
         window.request_animation_frame();
         let f = fraction.clamp(0., 1.);
@@ -883,51 +752,27 @@ pub fn wave_fill(fraction: f32, color: Hsla) -> impl IntoElement {
     }).absolute().inset_0()
 }
 
-pub fn continuous_surface(radius: f32, color: Hsla) -> Div {
-    div().relative().child(canvas(|bounds, _, _| bounds, move |_, bounds, window, _| {
-        let inset = 0.;
-                let x = f32::from(bounds.left()) + inset;
-                let y = f32::from(bounds.top()) + inset;
-                let w = f32::from(bounds.size.width) - inset * 2.;
-                let h = f32::from(bounds.size.height) - inset * 2.;
-                let r = (radius - inset).max(0.).min(w / 2.).min(h / 2.);
-                let pt = |a, b| point(px(a), px(b));
-                let mut path = PathBuilder::fill();
-                // Two cubics per corner: zero curvature at the straight joins,
-                // a shared tangent/curvature at the midpoint, and a circular-size
-                // diagonal inset rather than the previous overly square curve.
-                let corner = |path: &mut PathBuilder, sx: f32, sy: f32, ux: f32, uy: f32, vx: f32, vy: f32| {
-                    let q = |u: f32, v: f32| pt(sx + r * (u * ux + v * vx), sy + r * (u * uy + v * vy));
-                    path.cubic_bezier_to(q(std::f32::consts::FRAC_1_SQRT_2, 0.2928932), q(0.2071068, 0.), q(0.4142136, 0.));
-                    path.cubic_bezier_to(q(1., 1.), q(1., 0.5857864), q(1., 0.7928932));
-                };
-                path.move_to(pt(x + r, y));
-                path.line_to(pt(x + w - r, y));
-                corner(&mut path, x + w - r, y, 1., 0., 0., 1.);
-                path.line_to(pt(x + w, y + h - r));
-                corner(&mut path, x + w, y + h - r, 0., 1., -1., 0.);
-                path.line_to(pt(x + r, y + h));
-                corner(&mut path, x + r, y + h, -1., 0., 0., -1.);
-                path.line_to(pt(x, y + r));
-                corner(&mut path, x, y + r, 0., -1., 1., 0.);
-                path.close();
-                if let Ok(path) = path.build() { window.paint_path(path, color); }
-    }).absolute().inset_0())
+
+/// A path as people read it: the home folder as "~".
+pub(crate) fn tilde(p: &std::path::Path) -> String {
+    match dirs::home_dir().and_then(|h| p.strip_prefix(&h).ok().map(|r| r.to_path_buf())) {
+        Some(r) => format!("~/{}", r.display()),
+        None => p.display().to_string(),
+    }
 }
 
-pub fn header_icon(id: &'static str, name: &'static str) -> Stateful<Div> {
-    div().id(id).no_drag().size(px(crate::app::HEADER_ACTIONS_H)).rounded(px(8.)).flex_none().flex().items_center().justify_center().cursor_pointer()
-        .hover(|s| s.bg(Theme::fill_hover())).active(|s| s.bg(Theme::fill_pressed())).child(icon(name, 18., Theme::icon()))
+/// The breadcrumbs' size in every page header (a document's, a folder's, 主页's): shadcn's
+/// Breadcrumb, text-sm.
+pub const CRUMB_SIZE: f32 = 14.;
+
+/// shadcn's Breadcrumb (the user's call, 2026-11-25): the crumbs before the page, their separators
+/// and the "…" in `muted-foreground` (BreadcrumbLink), `foreground` under the pointer; the current
+/// page in `foreground` (BreadcrumbPage), the same weight.
+pub fn crumb_ink() -> Hsla { crate::design::color::muted_foreground() }
+pub fn crumb_page() -> Hsla { crate::design::color::foreground() }
+
+/// A page header's icon button (search, new, more): `Button::ghost`, header-tall.
+pub fn header_icon(id: &'static str, name: &'static str) -> crate::design::Button {
+    crate::design::Button::ghost(id).icon(name).size(px(crate::app::HEADER_ACTIONS_H)).no_drag()
 }
 
-pub(crate) fn checkbox(on: bool) -> Div {
-    div()
-        .size(px(16.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(4.))
-        .when(on, |d| d.bg(Theme::primary()).child(icon("todo-check", 12., Theme::bg_body())))
-        .when(!on, |d| d.border_1().border_color(Theme::todo_box()).bg(crate::theme::raised(Theme::bg_body())))
-}

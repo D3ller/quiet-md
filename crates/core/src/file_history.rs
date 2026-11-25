@@ -6,11 +6,11 @@ pub struct FileState {
     pub folder: bool,
     pub parent: Option<String>,
     pub order: u64,
-    pub root_order: Option<u64>,
+    pub top_order: Option<u64>,
 }
 impl FileState {
-    pub fn of(e: &Entry) -> Self { Self { title: e.title.clone(), folder: e.meta.folder.is_some(), parent: e.meta.parent.clone(), order: e.meta.order, root_order: e.meta.root_order } }
-    fn place(&self) -> (&Option<String>, u64, Option<u64>) { (&self.parent, self.order, self.root_order) }
+    pub fn of(e: &Entry) -> Self { Self { title: e.title.clone(), folder: e.meta.folder.is_some(), parent: e.meta.parent.clone(), order: e.meta.order, top_order: e.meta.top_order } }
+    fn place(&self) -> (&Option<String>, u64, Option<u64>) { (&self.parent, self.order, self.top_order) }
 }
 
 #[derive(Clone)]
@@ -20,6 +20,8 @@ pub struct FileDelta { pub id: String, pub before: Option<FileState>, pub after:
 #[derive(Default)]
 pub struct FileChanges(std::sync::Arc<std::sync::Mutex<Vec<FileDelta>>>, bool);
 impl FileChanges {
+    /// A journal nothing writes to (no library to watch).
+    pub fn none() -> Self { FileChanges(Default::default(), true) }
     pub fn take(self) -> Vec<FileDelta> {
         if self.1 { return vec![]; }
         let mut merged: HashMap<String, FileDelta> = HashMap::new();
@@ -41,10 +43,16 @@ impl Store {
         changes
     }
 
+    /// Record into `changes` too: one journal across every top-level folder.
+    pub fn share_file_changes(&mut self, changes: &FileChanges) {
+        self.file_changes.retain(|w| w.strong_count() > 0);
+        self.file_changes.push(std::sync::Arc::downgrade(&changes.0));
+    }
+
     pub(super) fn file_state(&self, id: &str) -> Option<FileState> {
         let m = self.index.get(id)?;
         let title = m.folder.clone().or_else(|| self.load(id).ok().map(|d| d.title.text))?;
-        Some(FileState { title, folder: m.folder.is_some(), parent: m.parent.clone(), order: m.order, root_order: m.root_order })
+        Some(FileState { title, folder: m.folder.is_some(), parent: m.parent.clone(), order: m.order, top_order: m.top_order })
     }
 
     pub(super) fn record_file_change(&self, id: &str, before: Option<FileState>) {
@@ -59,9 +67,9 @@ impl Store {
         if !self.file_changes.iter().any(|w| w.strong_count() > 0) { return; }
         for (id, m) in &self.index {
             let old = previous.get(id);
-            if old.is_some_and(|o| (&o.parent, o.order, o.root_order) == (&m.parent, m.order, m.root_order)) { continue; }
+            if old.is_some_and(|o| (&o.parent, o.order, o.top_order) == (&m.parent, m.order, m.top_order)) { continue; }
             let before = old.and_then(|o| self.file_state(id).map(|mut state| {
-                state.parent = o.parent.clone(); state.order = o.order; state.root_order = o.root_order; state
+                state.parent = o.parent.clone(); state.order = o.order; state.top_order = o.top_order; state
             }));
             self.record_file_change(id, before);
         }
@@ -76,7 +84,7 @@ impl Store {
         if self.is_markdown(id) { return Ok(()); }
         let mut expected = docxml::parse(previous)?;
         expected.title = crate::model::RichText::plain(title);
-        let disk = std::fs::read_to_string(self.path(id))?;
+        let disk = crate::vfs::read_to_string(self.path(id))?;
         // Accept only our title change, never unrelated edits from another instance.
         if docxml::serialize(&expected) == docxml::serialize(&docxml::parse(&disk)?) { loaded.insert(id.to_string(), disk); }
         Ok(())
@@ -96,7 +104,7 @@ impl Store {
             if let Some(expected) = from {
                 let m = &self.index[&c.id];
                 if to.as_ref().is_none_or(|t| t.place() != expected.place()) {
-                    anyhow::ensure!((&m.parent, m.order, m.root_order) == expected.place(), "文件位置已被其他操作改变，请先刷新");
+                    anyhow::ensure!((&m.parent, m.order, m.top_order) == expected.place(), "文件位置已被其他操作改变，请先刷新");
                 }
                 if let Some(target) = to && target.title != expected.title {
                     let title = if let Some(name) = &m.folder { name.clone() } else { self.load(&c.id)?.title.text };
@@ -105,23 +113,27 @@ impl Store {
             }
             match (from, to) {
                 (Some(_), None) => {
-                    anyhow::ensure!(!self.index.iter().any(|(id, m)| m.parent.as_deref() == Some(&c.id) && !deleted.contains(id.as_str())), "文件夹里有后来新增的内容，不能撤销创建");
-                    anyhow::ensure!(!self.trash.contains_key(&c.id) && !self.trash_path(&c.id).try_exists()?, "回收站存在冲突，未覆盖");
+                    anyhow::ensure!(!self.trash.contains_key(&c.id) && !self.trash_path(&c.id).fs_try_exists()?, "回收站存在冲突，未覆盖");
                     projected.remove(&c.id);
                 }
                 (None, Some(target)) => {
                     let saved = self.trash.get(&c.id).ok_or_else(|| anyhow::anyhow!("恢复内容已不在回收站，无法重做或撤销"))?;
-                    anyhow::ensure!(target.folder || self.trash_path(&c.id).is_file(), "恢复内容已不在回收站，无法重做或撤销");
+                    anyhow::ensure!(target.folder || self.trash_path(&c.id).fs_is_file(), "恢复内容已不在回收站，无法重做或撤销");
                     let mut meta = saved.meta.clone();
-                    meta.parent = target.parent.clone(); meta.order = target.order; meta.root_order = target.root_order;
+                    meta.parent = target.parent.clone(); meta.order = target.order; meta.top_order = target.top_order;
                     projected.insert(c.id.clone(), meta);
                 }
                 (Some(from), Some(to)) if from.place() != to.place() => {
                     let m = projected.get_mut(&c.id).unwrap();
-                    m.parent = to.parent.clone(); m.order = to.order; m.root_order = to.root_order;
+                    m.parent = to.parent.clone(); m.order = to.order; m.top_order = to.top_order;
                 }
                 _ => {}
             }
+        }
+        // A folder going away must be empty once this gesture's own moves are
+        // done (新建子文档 undone moves the page back out of its new folder).
+        for (c, _) in pairs.iter().filter(|(_, (f, t))| f.is_some() && t.is_none()) {
+            anyhow::ensure!(!projected.iter().any(|(id, m)| m.parent.as_deref() == Some(&c.id) && !deleted.contains(id.as_str())), "文件夹里有后来新增的内容，不能撤销创建");
         }
         // Validate what this gesture moves before touching files (including
         // external changes). Other entries are not its business: an old page
@@ -138,22 +150,12 @@ impl Store {
         }
         let depth = |index: &HashMap<String, Meta>, id: &str| { let mut n = 0; let mut p = index.get(id).and_then(|m| m.parent.clone()); while let Some(q) = p.filter(|_| n < 64) { n += 1; p = index.get(&q).and_then(|m| m.parent.clone()); } n };
         let result = (|| -> Result<()> {
-            // What goes to the 回收站, deepest first; the root is the outermost
-            // folder going with it.
-            let mut gone: Vec<&str> = pairs.iter().filter(|(_, (f, t))| f.is_some() && t.is_none()).map(|(c, _)| c.id.as_str()).collect();
-            gone.sort_by_key(|id| std::cmp::Reverse(depth(&self.index, id)));
-            let roots: HashMap<&str, Option<String>> = gone.iter().map(|id| {
-                let mut root = None;
-                let mut ancestor = self.index.get(*id).and_then(|m| m.parent.clone());
-                while let Some(p) = ancestor.filter(|p| deleted.contains(p.as_str())) { ancestor = self.index.get(&p).and_then(|m| m.parent.clone()); root = Some(p); }
-                (*id, root)
-            }).collect();
-            for id in gone { self.trash_one(id, roots[id].clone())?; }
-            // What comes back, folders first.
+            // What comes back, folders first; then the moves, so a page can go
+            // into a folder that just came back or out of one about to go.
             let mut back: Vec<(&str, &FileState)> = pairs.iter().filter_map(|(c, (f, t))| if f.is_none() { t.as_ref().map(|t| (c.id.as_str(), t)) } else { None }).collect();
             back.sort_by_key(|(id, _)| depth(&projected, id));
             for (id, target) in back {
-                self.untrash(id, target.parent.clone(), Some((target.order, target.root_order)))?;
+                self.untrash(id, target.parent.clone(), Some((target.order, target.top_order)))?;
             }
             // Moves and renames.
             for (c, (from, to)) in &pairs {
@@ -165,20 +167,31 @@ impl Store {
                 if from.title != to.title {
                     if !to.folder && !self.index[&c.id].markdown && !self.index[&c.id].local() {
                         let path = self.path(&c.id);
-                        let text = std::fs::read_to_string(&path)?;
+                        let text = crate::vfs::read_to_string(&path)?;
                         let mut doc = docxml::parse(&text)?;
                         doc.title = crate::model::RichText::plain(&to.title);
                         // Only the title changes: links stay as written.
                         let out = docxml::serialize(&doc);
                         if out != text { write_atomic(&path, out.as_bytes())?; }
                     }
-                    self.follow_title(&c.id, &to.title)?;
+                    self.follow_title(&c.id, &to.title, true)?;
                     if let Some(m) = self.index.get_mut(&c.id) { m.modified = now(); }
                 }
                 if let Some(m) = self.index.get_mut(&c.id) && from.place() != to.place() {
-                    m.parent = to.parent.clone(); m.order = to.order; m.root_order = to.root_order;
+                    m.parent = to.parent.clone(); m.order = to.order; m.top_order = to.top_order;
                 }
             }
+            // What goes to the 回收站, deepest first; the root is the outermost
+            // folder going with it.
+            let mut gone: Vec<&str> = pairs.iter().filter(|(_, (f, t))| f.is_some() && t.is_none()).map(|(c, _)| c.id.as_str()).collect();
+            gone.sort_by_key(|id| std::cmp::Reverse(depth(&self.index, id)));
+            let roots: HashMap<&str, Option<String>> = gone.iter().map(|id| {
+                let mut root = None;
+                let mut ancestor = self.index.get(*id).and_then(|m| m.parent.clone());
+                while let Some(p) = ancestor.filter(|p| deleted.contains(p.as_str())) { ancestor = self.index.get(&p).and_then(|m| m.parent.clone()); root = Some(p); }
+                (*id, root)
+            }).collect();
+            for id in gone { self.trash_one(id, roots[id].clone())?; }
             self.save_index()?;
             self.save_trash()
         })();

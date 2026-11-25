@@ -5,7 +5,12 @@
 /archive/
 /shared-mock/*
 !/shared-mock/library/
+!/shared-mock/library-zh/
 !/shared-mock/guides/
 
 /dist-release.*
 .wrangler/
+/tools/vendor-sync/target
+
+# The web demo (web/build.sh, web/bundle.py): build output, deployed with the site.
+/site/public/demo/

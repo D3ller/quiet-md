@@ -208,11 +208,11 @@ struct State {
 }
 
 fn state_path() -> std::path::PathBuf {
-    crate::store::Store::internal_dir().join("emoji.json")
+    crate::store::Store::settings_dir().join("emoji.json")
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
-    let s = if cfg!(test) { None } else { std::fs::read(state_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()) };
+    let s = if cfg!(test) { None } else { fdl_core::vfs::read(state_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()) };
     Mutex::new(s.unwrap_or_default())
 });
 
@@ -221,7 +221,7 @@ fn save(s: &State) {
         return;
     }
     if let Ok(b) = serde_json::to_vec_pretty(s) {
-        let _ = std::fs::write(state_path(), b);
+        let _ = fdl_core::vfs::write(state_path(), b);
     }
 }
 
@@ -336,7 +336,7 @@ mod font_tests {
     #[test]
     fn bundled_emoji_font_draws_emoji() {
         let b = crate::assets::get(super::FONT).expect("bundled on Linux");
-        let ts = gpui::test_text_system();
+        let ts = std::rc::Rc::new(gpui::WindowTextSystem::new(std::sync::Arc::new(gpui::TextSystem::new(std::sync::Arc::new(gpui_wgpu::CosmicTextSystem::new("Noto Sans"))))));
         // Twice: the second copy replaces the first (vendor/PATCHES.md #43).
         ts.add_fonts(vec![std::borrow::Cow::Borrowed(b)]).unwrap();
         ts.add_fonts(vec![std::borrow::Cow::Borrowed(b)]).unwrap();

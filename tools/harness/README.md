@@ -1,84 +1,124 @@
-# 脚本驱动（harness）
+# UI script harness
 
-用 `FDL_SCRIPT` 回放一份逐行脚本来操作窗口，并截图。整个过程不碰用户的文档库：每次运行都先把 `lib_dir` 复制一份到 `work_dir/lib`，再用 `QUIET_MD_HOME` 指向这份副本。
+Use `FDL_SCRIPT` to drive a window and take screenshots with a line-oriented script. Each run first copies `lib_dir` to `work_dir/lib` and points `QUIET_MD_HOME` at the copy to keep the user's library safe.
 
 ```sh
-cargo build --release --features devtools   # 正式构建不带脚本驱动
-python3 tools/harness/run.py tools/harness/examples/scroll.txt            # 默认用 lib_clean，结果在 /tmp/fdl-run
-python3 tools/harness/run.py my.txt /path/to/lib /tmp/my-run              # 自定义文档库和输出目录
+cargo build --release --features devtools   # Production builds omit the script driver
+python3 tools/harness/run.py tools/harness/examples/scroll.txt            # Uses lib_clean and writes to /tmp/fdl-run
+python3 tools/harness/run.py my.txt /path/to/lib /tmp/my-run              # Custom input library and output directory
 FDL_BIN=/other/quiet_md python3 tools/harness/run.py my.txt
 ```
 
-- 截图：`<work_dir>/<name>.png`。`shot` 是离屏渲染，没有系统玻璃和桌面，透明的侧栏铺在窗口底色（和全屏时一样）上；要拍到真实的玻璃用 `deskshot`。和改动前（侧栏为黑色）的二进制做 `compare.py` 时，侧栏区域会有差异。
-- 日志：`<work_dir>/log`。性能数字用 `grep -a bench log` 查看。
-- `lib_clean/` 是一个审查用的文档库，含一篇「全部 Block 样式审查」和几张示例图片。
-- `winid.swift` 列出屏幕上 quiet_md 窗口的 window id（`swift winid.swift`），用来配合系统截图。
+- Screenshots go to `<work_dir>/<name>.png`. An offscreen `shot` draws the transparent sidebar on the window background, as in fullscreen, without the desktop or system glass. Use `deskshot` to capture the actual glass. Comparing against an older binary with a black sidebar will show sidebar differences.
+- Logs go to `<work_dir>/log`. Run `grep -a bench log` for benchmark results.
+- `lib_clean/` contains a review document covering all block styles and several example images.
+- Run `swift winid.swift` to list on-screen quiet_md window IDs for system screenshots.
 
-## 截图回归
+## Screenshot regression checks
 
 ```sh
-python3 tools/harness/compare.py tools/harness/examples/menus.txt <旧版二进制> target/release/quiet_md
+python3 tools/harness/compare.py tools/harness/examples/menus.txt <old-binary> target/release/quiet_md
 ```
 
-- 用同一份脚本分别跑两个版本，逐张逐像素比较截图。有差异时输出差异像素数和范围，并把差异图写到 `/tmp/fdl-compare/diff-<名字>.png`。
-- 只移动代码、不改外观的重构（拆模块、换 token、共用组件），应当每张都是 `identical`。
-- `examples/menus.txt` 依次打开「…」菜单和页宽子菜单、编辑模式菜单、斜杠菜单、块菜单、侧栏右键菜单、帮助菜单。
-- `python3 tools/harness/table_resize.py` 在临时文档库中验证调整表格列宽时页面位置不跳动，覆盖屏幕外光标、单元格内光标、无变化拖拽、保存和撤销重做；需要 Pillow。
-- `python3 tools/harness/table_paste.py` 用模拟剪贴板验证 Markdown 表格按内容分配初始列宽，覆盖中文、粘贴、文件导入、保存重开和撤销重做，并确认已有列宽保留。
-- `python3 tools/harness/checkbox_toggle.py` 在临时文档库中验证点击任务框只切换完成状态，保留光标、选区和滚动位置，覆盖两种主题、嵌套、提示块、表格、保存和撤销重做；需要 Pillow。`CHECKBOX_CASES` 可指定逗号分隔的场景名。
-- `python3 tools/harness/scroll_intent.py` 验证标题折叠/展开保留视口和文字选区、隐藏光标迁到标题后仍可见、输入/方向键仍跟随光标，以及分栏调整与两种主题代码换行的保存和位置保持；需要 Pillow。`SCROLL_CASES` 可指定逗号分隔的场景名。
-- `python3 tools/harness/pointer_properties.py` 逐项验证图片对齐、附件卡片/预览、提示块颜色/图标/默认设置、倒计时、日期提醒和单元格背景/垂直对齐，核对视口、编辑位置、保存及撤销重做；需要 Pillow。`PROPERTY_CASES` 可指定逗号分隔的场景名；单独运行撤销场景时，会先验证对应基础操作确实生效。
-- `python3 tools/harness/clipboard_images.py` 用模拟剪贴板验证 TIFF 截图、图片附带文字、多图、光标处插入、保存、撤销重做，以及纯文本和富文本粘贴；需要 Pillow。
-- `python3 tools/harness/paste_remote_images.py` 用本机 HTTP 服务和模拟剪贴板验证从网页粘贴的网络图片下载后变成文档库自己的图片（#220），覆盖撤销重做、关闭「自动下载网络图片」时不联网、已过期链接保持原样；需要 Pillow。
-- 比较时光标不闪烁（`FDL_NOBLINK`）。脚本开头要先把指针移到空白处，否则真实鼠标的位置会以 hover 的形式出现在截图里。
-- 旧版二进制可以这样编：`git worktree add /tmp/old <提交>`，在那里用 `CARGO_TARGET_DIR=<本仓库>/target cargo build --release --features devtools`，再把二进制复制出来。
+- The comparison runs the same script against both binaries and compares every screenshot pixel by pixel. It reports the number and bounds of changed pixels and writes differences to `/tmp/fdl-compare/diff-<name>.png`.
+- For appearance-preserving refactors such as splitting modules, replacing tokens or sharing components, every image should report `identical`.
+- `examples/menus.txt` opens the More menu and page width submenu, edit mode menu, slash menu, block menu, sidebar context menu and help menu in sequence.
+- `python3 tools/harness/table_resize.py` checks that resizing columns preserves page position in a temporary library, covering an offscreen caret, a caret in a cell, a drag with no change, saving, undo and redo. Requires Pillow.
+- `python3 tools/harness/create_menu_stable.py` opens 我的文档's "+" menu, adds a file to the library while it is open and checks that the menu, its 导入 rows included, looks the same seconds later (every 新建 menu shows them). Requires Pillow.
+- `python3 tools/harness/table_paste.py` uses a simulated clipboard to verify content-based initial Markdown column widths, including Chinese text, paste, import, save/reopen and undo/redo. It also checks that existing widths survive.
+- `python3 tools/harness/table_note.py` checks a 数据表's 笔记 column in a scratch library: the column added, a note made for an empty cell and written in the record panel, save and reopen, search, undo/redo through the trash, deleting a record with its note and undoing it, pointing a cell at an existing note, a retitled note renaming its file with the cell following, and opening the note as a page. Needs a build with `--features devtools`. Set `TABLE_NOTE_SHOTS` to keep the screenshots.
+- `python3 tools/harness/checkbox_toggle.py` checks that clicking a task checkbox changes completion while preserving the caret, selection and scroll position. It covers both themes, nesting, callouts, tables, save and undo/redo in a temporary library. Requires Pillow. Set `CHECKBOX_CASES` to a comma-separated list of scenarios.
+- `python3 tools/harness/board_text_inplace.py` checks that a board text stays where it is when its editor opens: the text as drawn and in the editor must match pixel for pixel but for the caret. It covers shapes (rounded and sharp rectangle, ellipse, diamond), free text, an arrow label, several and wrapped lines, Chinese and English, the hand-drawn font with Xiaolai and Nunito, 120% zoom and both themes. Requires Pillow.
+- `python3 tools/harness/board_reload.py` checks a 画板 written by another program while it is open: a shape added outside shows within the 2 s poll with the viewport kept, a half-written file leaves the board as it was until it is whole, and a change outside while the board is edited here is not written over (保存失败, then 重新载入 takes the disk version onto the open board). Needs a build with `--features devtools`.
+- `python3 tools/harness/blank_lines.py` checks that blank lines and spaces typed in a page stay, in a Markdown file and a DocxXML page: Enter pressed several times, a line of only spaces, spaces at a line's start, middle and end. After the autosave the page must look the same when another program changes the file and the app takes it in, when it is opened again and after a relaunch, and each file must hold exactly the expected text. Requires Pillow.
+- `python3 tools/harness/scroll_intent.py` checks that folding and expanding headings preserves the viewport and selection, a hidden caret stays visible after moving to the heading, and typing or arrow keys still follow the caret. It also checks persistence and position when resizing columns or wrapping code in either theme. Requires Pillow. Select scenarios with `SCROLL_CASES`.
+- `python3 tools/harness/pointer_properties.py` checks image alignment, attachment cards and previews, callout colors/icons/defaults, countdowns, date reminders, and cell backgrounds and vertical alignment. It verifies viewport and editing position, saves and undo/redo. Requires Pillow. Select comma-separated scenarios with `PROPERTY_CASES`. An isolated undo scenario first verifies its base operation.
+- `python3 tools/harness/clipboard_images.py` uses the simulated clipboard for TIFF screenshots, images accompanied by text, multiple images, insertion at the caret, saving, undo/redo and plain or rich text paste. Requires Pillow.
+- `python3 tools/harness/gpui_patches.py` checks vendored GPUI behavior (layout, scrollbars, single-axis scrolling, image memory, custom shortcuts, first launch). See the validation section in vendor/PATCHES.md. Set `FDL_REF_BIN` to the pre-upgrade binary to compare line positions and ink coverage. Its libraries are pinned to the light look, and it reads the capture scale from the first shot, so it runs on a 1x display as well as a Retina one. Pass scenario names such as `text`, `scrollbar` or `images` on the command line. Requires Pillow.
+- These scripts create legacy libraries (`docs/<id>.xml` and `index.json`). The app migrates them to FORMAT 4 on open, including title-based files, real folders and `.assets/`. Read saved files with `doc_file` in `hlib.py` and convert expected asset paths with `as_migrated`.
+- `python3 tools/harness/optimistic_rename.py` checks 重命名 written in the background (`src/tree_writes.rs`): the row has the new name before the folder does, a page inside opens and the open one saves in the renamed folder, a second rename before the first lands, a failed rename back in its field with what was typed, 移动到 into another folder (and one that fails), a taken top-level folder name. It holds each write back with `FDL_TREE_WRITE_DELAY`.
+- `python3 tools/harness/import_open.py` checks that what an import brings in is in front as soon as it finishes: a Markdown file, a Markdown folder, an Obsidian vault (as a folder and through 从其他应用导入…), a 思源笔记 workspace and a vault the 从其他应用导入… panel finds in a stand-in home folder, each through a folder's "+" menu into a temporary library (an Obsidian vault takes 导入一份副本 when asked). It uses the `showing <title>` step.
+- `python3 tools/harness/attachment_window.py` checks that a Markdown attachment opens in a window of its own (in place, as 打开文件… does): the card clicked opens a second window on the attachment's own file, a save there changes that file and the size on the card in the first window, the card clicked again opens no third window, its eye and a PDF still ask for Quick Look (only logged in a scripted run), and a double click opens it again once that window is closed. It uses the `window` and `windows` steps. Requires Pillow.
+- `python3 tools/harness/paste_remote_images.py` uses local HTTP and a simulated clipboard to verify remote images pasted from webpages become library assets (#220). It covers undo/redo, zero network requests when automatic downloads are disabled, and preservation of expired links. Requires Pillow.
+- Comparisons disable caret blinking (`FDL_NOBLINK`). Move the pointer to an empty spot at the start of the script so the real cursor position does not trigger hover in the screenshots.
+- To build an older binary, run `git worktree add /tmp/old <commit>`, then `CARGO_TARGET_DIR=<repository>/target cargo build --release --features devtools` there. Copy the resulting binary out before building another version.
 
-## 脚本命令
+## Script commands
 
-每行一条命令；`#` 开头的是注释。完整说明见 `src/devtools.rs` 顶部。
+Write one command per line. Lines beginning with `#` are comments. See the top of `src/devtools.rs` for the full reference.
 
-| 命令 | 作用 |
+| Command | Action |
 |---|---|
-| `wait <ms>` | 等待，期间自己绘制帧（锁屏时也能出图） |
-| `key <按键>` | 发送按键，如 `key cmd-b`、`key escape` |
-| `type <文字>` | 输入文字（行尾空格有效） |
-| `move x y` / `click x y` / `dclick x y` / `rclick x y` / `drag x1 y1 x2 y2` | 鼠标操作（窗口坐标） |
-| `down x y` / `dragto x y` / `dragby dx dy` / `up x y` | 分步拖动：按下、拖到某点、从上一个拖动点挪一步、松开；`bench 30 dragby 4 0` 测拖拽每一步的耗时 |
-| `mdown x y` / `mdragto x y` / `mup x y` | 中键（按下滚轮）：按下、拖到某点、松开 |
-| `wheel x y dy [dx]` | 一次滚轮事件；可选的 `dx` 是横向分量（模拟触控板），正数露出右边的内容 |
-| `shot <名字>` / `burst <名字> n` | 截图；连拍 n 张，间隔约 8ms |
-| `mark <文字>` / `commit <文字>` | 输入法组合文字 / 提交 |
-| `clip html|text|image <文件>` / `clip clear` | 设置模拟剪贴板的内容（图片可追加多张，文字和 HTML 可并存），之后的 `key cmd-v` 粘贴它；`clear` 清空模拟内容 |
-| `pick <路径>[|<路径>…]` | 预先回答下一次打开 / 保存对话框，不弹出系统面板 |
-| `resize w h` | 调整窗口大小 |
-| `place x y` | 把窗口左上角放到主屏幕的 (x, y)，浮在其它窗口上（配合 `FDL_NOPARK` 拍桌面截图） |
-| `deskshot <名字> [边距]` | 连同窗口下面的内容截图，四周多留「边距」pt（默认 48）。窗口下面先用 `shared-mock/guides/backdrop.swift` 铺一张壁纸，见 `shared-mock/guides/shots.sh` |
-| `bench <n> <命令>` | 把一条命令跑 n 次，每次同步画一帧，输出耗时 |
-| `record <文件.mp4>` / `record stop` / `glide` / `scroll` / `caption` | 录制演示视频 |
-| `filedrag x y <路径>[\|<路径>…]` / `filedrop x y` / `fileleave` | 模拟从访达拖文件进窗口：拖到 (x, y)、在 (x, y) 松手、移出窗口 |
-| `activate` | 让窗口成为 key window。**会抢焦点，一般不要用** |
-| `quit` | 退出（`run.py` 会自动在末尾追加） |
+| `wait <ms>` | Wait while drawing frames, even with the screen locked. |
+| `key <key>` | Send a key, e.g. `key cmd-b` or `key escape`. |
+| `type <text>` | Type text, including trailing spaces. |
+| `move x y` / `click x y` / `dclick x y` / `rclick x y` / `drag x1 y1 x2 y2` | Move, click, double-click, right-click or drag in window coordinates. |
+| `row <title>` / `rrow <title>` / `hoverrow <title>` | Click, right-click or hover the middle of the sidebar row showing that text, as drawn in a frame drawn for the command: 主页, 我的文档, a document or folder, 设置, a page in 设置's own list. Menu items drawn with `design::MenuItem` count too, by their label: the + menu's 画板, a board's right-click menu. Use the interface language's text (`Home` in English). The topmost row wins if several match. If no such row is on screen, the run stops with exit code 3 and the log lists the rows it could see; `run.py` then exits with an error too. Prefer these to coordinates: the sidebar's rows move when it changes. |
+| `anchor <name>` | Click the middle of a control the app tracks by name, e.g. `anchor create-folder` (a folder page's "+"), `create-sidebar` (我的文档's "+"), `doc-font-picker` / `ui-font-picker` (外观's font lists) or `font-del-<id>` (a downloaded font's delete). A missing name stops the run like `row`. |
+| `window <n>` / `windows <n>` | Play the steps that follow in the n-th window (0 is the main one, then documents' own windows in the order they opened; they are parked like the main one and never take focus). `windows <n>` checks that this many are open, and stops the run like `row` otherwise. |
+| `showing <title>` | The document or folder page in front has that title; otherwise the run stops with exit code 3, as `row` does. |
+| `origin board` / `origin window` | Count the points of the pointer and file steps that follow (`click`, `drag`, `move`, `rclick`, `filedrag`…) from the open 画板's top-left corner, or from the window's again. The board opens in the note pane, so write board scripts this way rather than in window coordinates. No board open stops the run like `row`. Offsets (`dragby`, wheel deltas) are not moved. |
+| `down x y` / `dragto x y` / `dragby dx dy` / `up x y` | Press, drag to an absolute point, drag relative to the last point or release. Use `bench 30 dragby 4 0` to time individual steps. |
+| `mods shift cmd` / `mods none` | Hold these modifier keys (shift, cmd, alt, ctrl) for the mouse steps that follow; `none` lets go. |
+| `mdown x y` / `mdragto x y` / `mup x y` | Press, drag or release the middle (wheel) button. |
+| `wheel x y dy [dx]` | Send one wheel event. Optional horizontal delta simulates a trackpad. Positive values reveal content to the right. |
+| `pinch x y delta` | Send one trackpad pinch event at (x, y). A delta of 0.1 zooms in by 10%; negative values zoom out. |
+| `shot <name>` / `burst <name> n` | Take one screenshot or n shots about 8 ms apart. |
+| `mark <text>` / `commit <text>` | Set or commit IME composition text, after drawing the frame a preceding click asked for: a text field it opens (the board's text tool) takes input once painted. |
+| `clip html\|text\|image <file>` / `clip clear` / `clip save <file>` | Set the simulated clipboard for a subsequent `key cmd-v`. Append multiple images or combine text and HTML. Use clear to empty it. `save` writes the text a copy put there to a file. |
+| `pick <path>[\|<path>…]` | Supply the next open/save dialog response without opening a system panel. |
+| `resize w h` | Resize the window. |
+| `place x y` | Move the top-left corner to (x, y) on the main display above other windows. Use with `FDL_NOPARK` for desktop captures. |
+| `deskshot <name> [margin]` | Capture the window and underlying desktop with a margin in points (default 48). Place wallpaper behind the window first with `shared-mock/guides/backdrop.swift`. See `shared-mock/guides/shots/shots.sh`. |
+| `bench <n> <command>` | Repeat a command n times, synchronously drawing a frame each time and reporting timings. |
+| `record <file.mp4>` / `record stop` / `glide` / `scroll` / `caption` | Record demo video. |
+| `filedrag x y <path>[\|<path>…]` / `filedrop x y` / `fileleave` | Simulate dragging files from Finder to (x, y), dropping them there or leaving the window. |
+| `activate` | Make the window key. This takes focus. Avoid it in scripts on the user's machine. |
+| `quit` | Quit. `run.py` appends this automatically. |
 
-环境变量：
+### Environment variables
 
-- `FDL_SHOTS`：截图目录（`run.py` 已设好）；
-- `FDL_TRACE`：输出事件跟踪；
-- `FDL_NOPARK`：不把窗口挪到屏幕外；
-- `FDL_WINDOW_CAPTURE`：改用窗口服务器截图，截图里带系统画的红绿灯；
-- `FDL_NOBLINK`：光标不闪烁（`compare.py` 已设好）。
-- `FDL_RECORD_FPS`：录屏帧率，默认 30。
+- `FDL_SHOTS` sets the screenshot directory (set by `run.py`).
+- `FDL_TRACE` enables event tracing.
+- `FDL_NOPARK` keeps the window on screen. Without it the window is parked past the outer edge of the rightmost display, one sliver showing, so it neither covers the user's windows nor stops rendering.
+- `FDL_KEEP_OPEN` keeps the app running when the script ends. Without it a script that ends without `quit` quits anyway.
+- `FDL_WINDOW_CAPTURE` uses the window server to capture system-drawn window controls.
+- `FDL_NOBLINK` disables caret blinking (set by `compare.py`).
+- `FDL_RECORD_FPS` sets the recording frame rate (default 30).
+- `FDL_RECORD_START=<file.mp4>` records from the window's first frame, before the script starts (it waits about a second for the window to settle): launch and first-open loading. `record stop` ends it.
+- `FDL_ANIMATE` makes `wait` draw a frame every 16 ms (and record each one), the main thread spinning in between. Animations ask the system for their frames, which it throttles for an inactive window and stops while the screen is locked, and timers fall behind with the display asleep; set it to record or shoot animations.
+- `QUIET_MD_FONT_URL`, `QUIET_MD_FONT_DIR` and `QUIET_MD_TRIAL_FONTS` are passed through: downloadable fonts (the board's Xiaolai, document fonts) are fetched from that folder into that cache, a compiled-in Xiaolai is ignored, and the trial fonts are listed (docs/FONTS.md). `python3 tools/harness/board_font.py` checks the board's font and its download note, `python3 tools/harness/doc_fonts.py` the document font list (`--compare` shoots an article in every font).
+- `QUIET_MD_UPDATE_URL` is passed through: the updater reads that folder instead of download.quiet.md. To test forced updates see docs/UPDATES.md. Downloads land in `~/Library/Caches/com.s1dashu.quietmd` of the `HOME` the app sees.
+- `FDL_TREE_WRITE_DELAY=<ms>` holds every background write of the tree (a sidebar drop, 重命名) back that long, so a script can act while it is on its way.
+- `QUIET_MD_COMPONENTS=1` opens only the 组件库 panel (`src/gallery/`, the same as `quiet_md --components`): no main window and no library; the script plays in the panel.
 
-## 使用规则
+## Rules for running scripts
 
-脚本跑在用户正在使用的电脑上，必须遵守以下规则：
+The harness runs on a computer someone may be using.
 
-- 不用真实的 ⌘C / ⌘V 系统剪贴板；`key cmd-v` 只在 `clip` 之后使用。
-- 不抢焦点：不用 `activate`。窗口默认被挪到屏幕外渲染。
-- 不点：
-  - 设置 › 文档库的「在访达中显示」按钮，主页和文件夹页「…」菜单里的「在访达中打开」；
-  - 链接、「网页搜索」、打开链接类按钮（会启动浏览器）；
-  - 打印（会弹出系统打印面板）；
-  - 快速查看 / `qlmanage -p`。
-- 不用 `open` 命令。
-- 需要选文件时，用 `pick a|b` 代替系统对话框。
-- 不要拿用户的真实文档库当 `lib_dir`。确实需要时只读复制一份，产物里也不要提交用户的内容。
+- Leave the real ⌘C/⌘V clipboard alone. Use `key cmd-v` only after `clip`.
+- Avoid stealing focus. Never use `activate`. By default the harness moves the window offscreen to render it.
+- Leave nothing running. A script quits the app when it ends (unless `FDL_KEEP_OPEN`); a launcher that kills a hung app or starts several must check afterwards that none of its own `quiet_md` processes are left.
+- Do not click Show in Finder in Settings › Library, or Open in Finder in the home or folder More menu.
+- Do not click links, Web Search or link-opening buttons that launch a browser. Avoid Print (system print panel), Quick Look and `qlmanage -p`.
+- Do not use the `open` command. Use `pick a|b` when a script needs to select files.
+- Never use the real user library as `lib_dir`. If its contents are essential, make a read-only copy and keep user content out of committed artifacts.
+
+## Release self-test
+
+Shipped builds have no script driver, so a release is checked by scenarios compiled into the app (`src/selftest.rs`). `quiet_md --self-test <empty dir> [report.json]` takes no script and accepts no other input. It creates a library in `<dir>/文档库 Library` and starts the app twice from the same executable, with `QUIET_MD_HOME` set to that library. It never opens `~/Documents/Quiet.md`. Each launch goes through normal startup, including the GPU, window, fonts and assets, but skips onboarding, the global shortcut and focus stealing, as scripted runs do. It runs its scenarios in-process, then quits through the app's own quit path. Scenarios check library files and app state, not pixels, and between steps they wait on a condition instead of a fixed delay.
+
+- **Launch 1:** seeding the Getting Started guides into an empty library (the window must render something other than a blank frame), a new document that is typed into and saved automatically, Copy as Markdown through the clipboard (the clipboard is restored afterwards), search in Latin and CJK, importing a Markdown file and a folder, moving to the trash and restoring, opening a new board, and checking for updates against a local server (`127.0.0.1`, never the internet). The update manifest must validate and the package must download. The release key must reject the package because it is signed with a throwaway key, which does verify it.
+- **Launch 2:** the document from launch 1 reopens with its text, and the library has not been seeded again.
+
+The report records each scenario's result and time in milliseconds. A failed scenario's entry gives the error and the path to `failed-<scenario>.png`, an offscreen render of the window. A crash or hang fails the scenario that was running. Its entry includes the panic from `<dir>/logs/quiet-md.log`. A launch counts as hung after `QUIET_MD_SELF_TEST_TIMEOUT` seconds (default 180). The command exits with 0 when every scenario passes, 1 when one fails, and 2 for usage errors. A full run takes about 2 seconds.
+
+```sh
+cargo build --release && target/release/quiet_md --self-test "$(mktemp -d)/run"   # Development build
+scripts/self-test-macos.sh dist-release.*/quiet-md-<version>-macos-arm64.zip       # A package: unzipped into a path with spaces and CJK
+scripts/self-test-windows.ps1 -Installer quiet-md-<version>-windows-x64-setup.exe  # Installs silently, runs, uninstalls
+```
+
+CI runs the macOS script on both packages, with Intel under Rosetta. It runs the Windows script on the installer, installing into a temporary folder whose path contains spaces and CJK. Both jobs upload `self-test/` (reports, logs and screenshots, without the library) as `self-test-macos` / `self-test-windows`. For a release, run the macOS script on each signed, notarized zip from `scripts/release.sh` before uploading it. A package signed with a team identity must also pass `spctl` (Gatekeeper).
+
+To add a scenario, write an `async fn` on `Run` in `src/selftest.rs` that drives the app through `Workspace`/`Editor` methods or `type_text`/`key`, then waits with `until(what, secs, condition)` and returns `Err` with a message on failure. List it with `scenario!` in `phase1` or `phase2`. Pass anything launch 2 needs through `Carry`. Keep each scenario to a few seconds and its fixtures inside the run directory.

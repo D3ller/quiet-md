@@ -8,7 +8,8 @@ use crate::model::*;
 use std::cell::{Cell, RefCell};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::ops::Range;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 
 pub const TITLE: BlockId = BlockId(0);
@@ -377,13 +378,16 @@ fn keep_outside_history(now: &Document, restored: &mut Document) {
     now.for_each_block(|b| {
         folded.insert(b.id, b.folded);
     });
-    // Blocks in table cells never fold.
+    // Of the blocks in table cells only code blocks fold.
     fn walk(blocks: &mut [Block], folded: &HashMap<BlockId, bool>) {
         for b in blocks {
             if let Some(f) = folded.get(&b.id) {
                 b.folded = *f;
             }
             walk(&mut b.children, folded);
+            if let BlockKind::Table(t) = &mut b.kind {
+                t.rows.iter_mut().flatten().for_each(|cell| walk(&mut cell.blocks, folded));
+            }
         }
     }
     walk(&mut restored.blocks, &folded);
@@ -433,12 +437,20 @@ pub struct Core {
     path_misses: Cell<(u32, u32)>,
     /// A message for the view to toast (e.g. 当前位置不支持粘贴表格).
     pub notice: Option<&'static str>,
+    /// Backspace at the start of the body merges the first paragraph into the
+    /// title and moves the caret there (设置 › 退格键回到标题).
+    pub backspace_to_title: bool,
+    /// Where the caret last typed between a `$` / `$$` pair (#69): the pair
+    /// becomes an equation once the caret leaves it (`equation_on_leave`).
+    typed_in_equation: Option<Pos>,
 }
 
 impl Core {
     pub fn new(doc: Document) -> Self {
         let first = units(&doc).get(1).map(|u| u.id).unwrap_or(TITLE);
-        let start = if doc.title.is_empty() { TITLE } else { first };
+        // Not inside a folded code block: the caret there would open it.
+        let hidden = find_path(&doc.blocks, first).and_then(|p| block_at(&doc.blocks, &p)).is_some_and(|b| b.folded && matches!(b.kind, BlockKind::Code { .. }));
+        let start = if doc.title.is_empty() || hidden { TITLE } else { first };
         Core {
             doc,
             sel: Selection::caret(Pos::new(start, 0)),
@@ -454,6 +466,8 @@ impl Core {
             path_hits: Cell::new(u32::MAX),
             path_misses: Cell::new((0, 1)),
             notice: None,
+            backspace_to_title: false,
+            typed_in_equation: None,
         }
     }
 
@@ -586,6 +600,22 @@ impl Core {
         si != ei && i >= si && i <= ei
     }
 
+    /// Whether a click at `pos` lands inside what is already selected.
+    ///
+    /// A right-click inside the selection keeps it; anywhere else it has to
+    /// replace it (browsers get this wrong and Copy then acts on something
+    /// the user can no longer see selected).
+    pub fn selection_holds(&self, pos: Pos) -> bool {
+        if self.block_sel.is_some() {
+            return self.block_sel_ids().contains(&pos.block);
+        }
+        if self.sel.is_collapsed() {
+            return false;
+        }
+        let us = self.units();
+        self.range_in(pos.block, &us).is_some_and(|r| pos.offset >= r.start && pos.offset <= r.end)
+    }
+
     pub fn selected_text(&self) -> String {
         let us = self.units();
         let (s, e) = self.ordered_in(&us);
@@ -665,6 +695,43 @@ impl Core {
         hit
     }
 
+    /// Links to files a move rewrote on disk (`Store::follow_moved_links`:
+    /// `to` gives the new URL of one that changed), in the document and across
+    /// the undo / redo history, outside the edit history, so neither writes the
+    /// old path back. Whether the document changed.
+    pub fn relink_files(&mut self, to: &dyn Fn(&str) -> Option<String>) -> bool {
+        let has = |doc: &Document| doc.links().iter().any(|l| to(l).is_some());
+        for s in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            if has(&s.doc) { std::sync::Arc::make_mut(s).doc.map_links(&mut |l| to(l)); }
+        }
+        let hit = self.doc.map_links(&mut |l| to(l));
+        if hit { self.generation += 1; }
+        hit
+    }
+
+    /// Every file source this editor can still bring back: the cover, images,
+    /// attachments (inline ones too) and 数据表 files of the open document, and
+    /// of the undo and redo snapshots behind it. The unused-asset sweep reads
+    /// the disk, so without these a picture deleted a moment ago — still one
+    /// Undo away — would be taken as unused (#237).
+    pub fn asset_refs(&self) -> Vec<String> {
+        fn take(doc: &Document, out: &mut Vec<String>) {
+            out.extend(doc.cover.as_ref().map(|c| c.src.clone()));
+            doc.for_each_block(|b| {
+                match &b.kind {
+                    BlockKind::Image { src, .. } | BlockKind::File(FileBlock { src, .. }) => out.push(src.clone()),
+                    BlockKind::DataTable(t) => out.push(t.src.clone()),
+                    _ => {}
+                }
+                out.extend(b.text.runs.iter().filter_map(|r| r.marks.inline.as_ref().and_then(Inline::file)).map(|f| f.src.clone()));
+            });
+        }
+        let mut out = vec![];
+        take(&self.doc, &mut out);
+        for s in self.undo.iter().chain(self.redo.iter()) { take(&s.doc, &mut out); }
+        out
+    }
+
     pub fn break_coalescing(&mut self) {
         self.last_edit = None;
     }
@@ -699,6 +766,7 @@ impl Core {
     }
 
     pub fn undo(&mut self) -> bool {
+        self.typed_in_equation = None;
         let Some(s) = self.undo.pop_back() else { return false };
         self.generation += 1;
         let mut doc = s.doc.clone();
@@ -714,6 +782,7 @@ impl Core {
     }
 
     pub fn redo(&mut self) -> bool {
+        self.typed_in_equation = None;
         let Some(s) = self.redo.pop() else { return false };
         self.generation += 1;
         let mut doc = s.doc.clone();
@@ -989,6 +1058,37 @@ impl Core {
         self.insert_object(InlineKind::Equation(src.to_string()))
     }
 
+    /// The selected text as LaTeX source, if it can become an equation (#192):
+    /// within one text block (not the title or a code block), not blank, and
+    /// free of inline objects. Inline code and links are dropped.
+    pub fn selection_equation_source(&self) -> Option<String> {
+        let (s, e) = self.ordered();
+        if s.block != e.block || s.offset >= e.offset || s.block == TITLE || self.is_code(s.block) {
+            return None;
+        }
+        let part = self.text_of(s.block)?.slice(s.offset..e.offset);
+        let src = part.plain_text();
+        (!src.trim().is_empty() && part.runs.iter().all(|r| r.marks.inline.is_none())).then_some(src)
+    }
+
+    /// Turn the selected text into an inline equation with it as the source
+    /// (one undo step); returns the equation's position.
+    pub fn selection_to_equation(&mut self) -> Option<Pos> {
+        let src = self.selection_equation_source()?;
+        let (s, e) = self.ordered();
+        let mut marks = self.text_of(s.block)?.slice(s.offset..e.offset).runs.first()?.marks.clone();
+        marks.code = false;
+        marks.link = None;
+        marks.inline = Some(crate::docxml::to_inline(InlineKind::Equation(src)));
+        self.checkpoint(EditKind::Other);
+        self.break_coalescing();
+        let mut ins = RichText::default();
+        ins.push(EQUATION, marks);
+        self.text_mut(s.block)?.replace(s.offset..e.offset, &ins);
+        self.sel = Selection::caret(Pos::new(s.block, s.offset + EQUATION.len()));
+        Some(s)
+    }
+
     /// Insert a 按钮 at the caret; returns its position.
     pub fn insert_button(&mut self, b: &InlineButton) -> Option<Pos> {
         self.insert_object(InlineKind::Button(b.clone()))
@@ -1126,6 +1226,15 @@ impl Core {
         if let Some(b) = self.block_mut(id) {
             b.kind = BlockKind::Board(std::sync::Arc::new(bd));
         }
+        true
+    }
+
+    /// 数据表: which table and view block `id` shows, and its height. False when nothing changed.
+    pub fn set_table_ref(&mut self, id: BlockId, t: crate::table::TableRef) -> bool {
+        if !matches!(self.kind_of(id), Some(BlockKind::DataTable(old)) if *old != t) { return false; }
+        self.checkpoint(EditKind::Other);
+        self.break_coalescing();
+        if let Some(b) = self.block_mut(id) { b.kind = BlockKind::DataTable(t); }
         true
     }
 
@@ -1344,6 +1453,30 @@ impl Core {
             self.delete_atomic(p.block);
             return;
         }
+        // Unless 退格键回到标题 is on, a plain paragraph opening the body never
+        // merges into the title and the caret stays in the body (an empty one
+        // goes when text follows).
+        if !self.backspace_to_title && matches!(block.kind, BlockKind::Text) && !self.parent_is_text_block(p.block) && !self.first_in_quote(p.block) {
+            let us = self.units();
+            if let Some(i) = self.unit_index(&us, p.block)
+                && i > 0
+                && us[i - 1].id == TITLE
+                && us[i].scope.is_none()
+            {
+                if block.text.is_empty()
+                    && block.children.is_empty()
+                    && let Some(next) = us.get(i + 1).filter(|u| u.text && u.scope == us[i].scope && u.id != TITLE)
+                {
+                    let next = next.id;
+                    self.checkpoint(EditKind::Other);
+                    self.break_coalescing();
+                    self.remove_subtree(p.block);
+                    self.normalize();
+                    self.sel = Selection::caret(Pos::new(next, 0));
+                }
+                return;
+            }
+        }
         self.checkpoint(EditKind::Other);
         self.break_coalescing();
         match block.kind {
@@ -1367,16 +1500,18 @@ impl Core {
             return;
         }
         // First paragraph in a quote/callout: lift it out.
-        if let Some(parent) = self.parent_of(p.block).cloned()
-            && matches!(parent.kind, BlockKind::Quote | BlockKind::Callout { .. })
-            && parent.children.first().map(|c| c.id) == Some(p.block)
-        {
+        if self.first_in_quote(p.block) {
+            let parent = self.parent_of(p.block).unwrap().id;
             let b = self.remove_subtree(p.block).unwrap();
-            self.insert_before(parent.id, b);
+            self.insert_before(parent, b);
             self.normalize();
             return;
         }
         self.merge_into_previous(p.block);
+    }
+
+    fn first_in_quote(&self, id: BlockId) -> bool {
+        self.parent_of(id).is_some_and(|q| matches!(q.kind, BlockKind::Quote | BlockKind::Callout { .. }) && q.children.first().map(|c| c.id) == Some(id))
     }
 
     fn merge_into_previous(&mut self, id: BlockId) {
@@ -1815,9 +1950,11 @@ impl Core {
                 if let BlockKind::Code { .. } = k {
                     b.text = RichText::plain(b.text.plain_text());
                 }
-                // A folded heading hides its section, any other fold just the children: drop the fold
-                // rather than hide or reveal the blocks below.
-                if matches!(b.kind, BlockKind::Heading { .. }) != matches!(k, BlockKind::Heading { .. }) {
+                // A folded heading hides its section, a code block its code, any other fold just the
+                // children: drop the fold rather than hide or reveal something else.
+                if matches!(b.kind, BlockKind::Heading { .. }) != matches!(k, BlockKind::Heading { .. })
+                    || matches!(b.kind, BlockKind::Code { .. }) != matches!(k, BlockKind::Code { .. })
+                {
                     b.folded = false;
                 }
                 // Headings, lists and text can all hold children, so the
@@ -1887,6 +2024,23 @@ impl Core {
             b.folded = !b.folded;
         }
         self.fix_selection_after_fold(id);
+    }
+
+    /// Folds or opens a code block (saved like any fold, outside the edit
+    /// history). A caret inside the code it hides leaves for the block itself.
+    /// Returns whether anything changed.
+    pub fn set_code_folded(&mut self, id: BlockId, folded: bool) -> bool {
+        let Some(b) = self.block_mut(id) else { return false };
+        if !matches!(b.kind, BlockKind::Code { .. }) || b.folded == folded {
+            return false;
+        }
+        b.folded = folded;
+        self.generation += 1;
+        self.dirty = true;
+        if folded && self.block_sel.is_none() && (self.sel.head.block == id || self.sel.anchor.block == id) {
+            self.select_block(id);
+        }
+        true
     }
 
     /// The last block a folded heading hides (itself when nothing is hidden),
@@ -2128,6 +2282,52 @@ impl Core {
         if scope(self.sel.anchor.block) != scope(self.sel.head.block) {
             self.sel = Selection::caret(self.sel.head);
         }
+        true
+    }
+
+    /// Side drops accept a single image and a root image or an existing grid column.
+    pub fn can_move_image_beside(&self, image: BlockId, target: BlockId) -> bool {
+        if image == target || !matches!(self.kind_of(image), Some(BlockKind::Image { .. }))
+            || !matches!(self.kind_of(target), Some(BlockKind::Image { .. })) { return false; }
+        match self.parent_of(target) {
+            None => true,
+            Some(col) if matches!(col.kind, BlockKind::Column { .. }) => self.parent_of(col.id)
+                .is_some_and(|grid| matches!(grid.kind, BlockKind::Grid) && grid.children.len() < MAX_COLUMNS),
+            _ => false,
+        }
+    }
+
+    /// Move an image to a neighbouring column, creating a grid when needed.
+    /// The image id, dimensions and caption survive, and the entire move undoes once.
+    pub fn move_image_beside(&mut self, image: BlockId, target: BlockId, before: bool) -> bool {
+        if !self.can_move_image_beside(image, target) { return false; }
+        let column = self.parent_of(target).map(|b| b.id);
+        let grid = column.and_then(|col| self.parent_of(col).map(|b| b.id));
+        self.checkpoint(EditKind::Other);
+        let moved = self.remove_subtree(image).unwrap();
+        let new_column = Block::new(BlockKind::Column { ratio: 0.5 }, RichText::default()).with_children(vec![moved]);
+        if let (Some(grid), Some(column)) = (grid, column) {
+            let g = self.block_mut(grid).unwrap();
+            let at = g.children.iter().position(|c| c.id == column).unwrap() + usize::from(!before);
+            let ratio = 1. / (g.children.len() as f32 + 1.);
+            for col in &mut g.children {
+                if let BlockKind::Column { ratio: r } = &mut col.kind { *r *= 1. - ratio; }
+            }
+            let mut new_column = new_column;
+            new_column.kind = BlockKind::Column { ratio };
+            g.children.insert(at, new_column);
+        } else {
+            let grid = Block::new(BlockKind::Grid, RichText::default());
+            let slot = self.block_mut(target).unwrap();
+            let original = std::mem::replace(slot, grid);
+            let old_column = Block::new(BlockKind::Column { ratio: 0.5 }, RichText::default()).with_children(vec![original]);
+            slot.children = if before { vec![new_column, old_column] } else { vec![old_column, new_column] };
+        }
+        self.normalize();
+        self.clear_block_sel();
+        self.cell_sel = None;
+        self.sel = Selection::caret(Pos::new(image, 0));
+        self.fix_selection();
         true
     }
 
@@ -2757,13 +2957,14 @@ impl Core {
     /// Line-start trigger for `prefix` (text before the caret, trigger
     /// character included). `enter` is true when the trigger is Enter.
     fn block_trigger(&self, id: BlockId, prefix: &str, enter: bool) -> Option<BlockKind> {
+        let prefix = &ascii_marker(prefix);
         let cur = self.kind_of(id)?;
         let in_cell = self.is_in_table(id);
         let in_quote = self.parent_kind_is(id, |k| matches!(k, BlockKind::Quote));
         let in_callout = self.parent_kind_is(id, |k| matches!(k, BlockKind::Callout { .. }));
         let code = |lang: &str| -> Option<BlockKind> {
             (!lang.contains(char::is_whitespace) && !in_callout)
-                .then(|| BlockKind::Code { lang: crate::lang::resolve(lang).into(), caption: None, wrap: false })
+                .then(|| BlockKind::Code { lang: crate::lang::resolve(lang).into(), caption: None, wrap: false, show_code: false })
         };
         if enter {
             return prefix.strip_prefix("```").and_then(code);
@@ -2891,6 +3092,47 @@ impl Core {
         true
     }
 
+    /// 中英文之间自动加空格 while typing: the `n` bytes just typed before the
+    /// caret get a space between them and the character before them, and
+    /// among themselves, where `spacing::text_gaps` puts one; not in code.
+    /// Coalesces with the typing, so one 撤销 takes both.
+    pub fn space_typed(&mut self, n: usize) -> bool {
+        let p = self.sel.head;
+        if !self.sel.is_collapsed() || self.is_code(p.block) { return false; }
+        let Some(start) = p.offset.checked_sub(n) else { return false };
+        let Some(t) = self.text_of(p.block) else { return false };
+        let gaps: Vec<usize> = crate::spacing::text_gaps(t).into_iter().filter(|g| (start..p.offset).contains(g)).collect();
+        if gaps.is_empty() { return false; }
+        self.checkpoint(EditKind::Typing);
+        crate::spacing::insert_spaces(self.text_mut(p.block).unwrap(), &gaps);
+        self.sel = Selection::caret(Pos::new(p.block, p.offset + gaps.len()));
+        true
+    }
+
+    /// 整理本文空格: the spaces `space_typed` adds, everywhere in the document
+    /// (title, folded and table text too; not code), as one undo step.
+    /// Returns how many were added.
+    pub fn space_document(&mut self) -> usize {
+        let mut plan = vec![];
+        let title = crate::spacing::text_gaps(&self.doc.title);
+        if !title.is_empty() { plan.push((TITLE, title)); }
+        self.doc.for_each_block(|b| if b.kind.has_text() && !matches!(b.kind, BlockKind::Code { .. }) {
+            let g = crate::spacing::text_gaps(&b.text);
+            if !g.is_empty() { plan.push((b.id, g)); }
+        });
+        if plan.is_empty() { return 0; }
+        self.checkpoint(EditKind::Other);
+        self.break_coalescing();
+        for (id, gaps) in &plan {
+            if let Some(t) = self.text_mut(*id) { crate::spacing::insert_spaces(t, gaps); }
+            // The selection stays on the characters it was on.
+            for p in [&mut self.sel.anchor, &mut self.sel.head] {
+                if p.block == *id { p.offset += gaps.iter().filter(|g| **g < p.offset).count(); }
+            }
+        }
+        plan.iter().map(|(_, g)| g.len()).sum()
+    }
+
     /// Inline Markdown, run after each typed character: the closing delimiter
     /// turns `**x**`, `__x__`, `*x*`, `_x_`, `***x***`, `~~x~~`, `~x~`
     /// (underline) and `` `x` `` into marks, in a fixed priority order.
@@ -2915,7 +3157,6 @@ impl Core {
             ("~", |m| m.underline = true, true),
             ("`", |m| m.code = true, false),
         ];
-        let boundary = |c: Option<char>| c.is_none_or(|c| c.is_whitespace() || "，。；：！？、）】》”’".contains(c));
         // `$x$` and `$$x$$` become an inline equation.
         for delim in ["$$", "$"] {
             if !before.ends_with(delim) || t.slice(0..p.offset).runs.last().is_some_and(|r| r.marks.code) {
@@ -2923,28 +3164,8 @@ impl Core {
             }
             let inner_end = before.len() - delim.len();
             let Some(open) = before[..inner_end].rfind(delim) else { continue };
-            let inner = &before[open + delim.len()..inner_end];
-            let src = crate::paste::markdown_equation_source(inner);
-            let money = delim == "$" && inner.starts_with(|c: char| c.is_ascii_digit()) && !crate::paste::is_numeric_math(inner);
-            if money || inner.trim().is_empty()
-                || inner.starts_with('$')
-                || inner.ends_with('$')
-                || inner.contains(EQUATION)
-                || before[..open].ends_with('$')
-                || !boundary(before[..open].chars().next_back())
-                || !boundary(after.chars().next())
-                || t.slice(open..p.offset).runs.iter().any(|r| r.marks.code || r.marks.inline.is_some())
-            {
-                continue;
-            }
-            let mut marks = t.marks_at(open + delim.len());
-            marks.inline = Some(crate::docxml::to_inline(InlineKind::Equation(src)));
-            self.checkpoint(EditKind::Other);
-            self.break_coalescing();
-            let mut ins = RichText::default();
-            ins.push(EQUATION, marks);
-            let t = self.text_mut(p.block).unwrap();
-            t.replace(open..p.offset, &ins);
+            let Some(src) = equation_between(t, open, inner_end, delim) else { continue };
+            self.make_equation(p.block, open..p.offset, open + delim.len(), src);
             self.sel = Selection::caret(Pos::new(p.block, open + EQUATION.len()));
             return true;
         }
@@ -2963,7 +3184,7 @@ impl Core {
             if before[..open].ends_with(dc) {
                 continue;
             }
-            if bounded && !(boundary(before[..open].chars().next_back()) && boundary(after.chars().next())) {
+            if bounded && !(md_boundary(before[..open].chars().next_back()) && md_boundary(after.chars().next())) {
                 continue;
             }
             if dc != '`' && t.slice(open..inner_end).runs.iter().any(|r| r.marks.code) {
@@ -2996,7 +3217,47 @@ impl Core {
             self.pending_marks = Some(m);
             return true;
         }
+        if equation_around(t, p.offset).is_some() { self.typed_in_equation = Some(p); }
         false
+    }
+
+    /// `$x$` / `$$x$$` typed delimiters first (#69): the caret typed between
+    /// the pair and has now left it, so it becomes an equation by the rules of
+    /// a typed closing `$`. While the caret stays inside, nothing happens.
+    pub fn equation_on_leave(&mut self) -> bool {
+        let Some(Pos { block, offset }) = self.typed_in_equation.take() else { return false };
+        if !self.markdown_enabled(block) { return false; }
+        let Some(t) = self.text_of(block) else { return false };
+        let at = offset.min(t.len());
+        if !t.text.is_char_boundary(at) { return false; }
+        let Some((range, inner, src)) = equation_around(t, at) else { return false };
+        let head = self.sel.head;
+        if self.sel.is_collapsed() && self.block_sel.is_none() && self.cell_sel.is_none() && head.block == block
+            && equation_around(t, head.offset).is_some_and(|(r, ..)| r.start == range.start) {
+            self.typed_in_equation = Some(head);
+            return false;
+        }
+        let shrink = range.len() - EQUATION.len();
+        self.make_equation(block, range.clone(), inner, src);
+        // The selection stays on the characters it was on.
+        for p in [&mut self.sel.anchor, &mut self.sel.head] {
+            if p.block == block && p.offset >= range.end { p.offset -= shrink; }
+            else if p.block == block && p.offset > range.start { p.offset = range.start + EQUATION.len(); }
+        }
+        true
+    }
+
+    /// `range` of `block` (a `$` pair and what is between, which starts at
+    /// `inner`) becomes an equation of `src`, as one undo step.
+    fn make_equation(&mut self, block: BlockId, range: Range<usize>, inner: usize, src: String) {
+        let t = self.text_of(block).unwrap();
+        let mut marks = t.marks_at(inner);
+        marks.inline = Some(crate::docxml::to_inline(InlineKind::Equation(src)));
+        self.checkpoint(EditKind::Other);
+        self.break_coalescing();
+        let mut ins = RichText::default();
+        ins.push(EQUATION, marks);
+        self.text_mut(block).unwrap().replace(range, &ins);
     }
 
     // ---- paste
@@ -3223,6 +3484,68 @@ impl Core {
     }
 }
 
+/// The full-width spellings a Chinese input method types for a line-start
+/// marker (`＃＃ `, `－ `, `—— `, `1． `, `＞ `, `···lang`), as the ASCII
+/// `block_trigger` matches. Only the comparison sees it: the prefix is
+/// removed either way, so ⌘Z still brings back what was typed.
+/// Where inline Markdown may open or close: a line edge, whitespace or CJK
+/// punctuation.
+fn md_boundary(c: Option<char>) -> bool { c.is_none_or(|c| c.is_whitespace() || "，。；：！？、）】》”’".contains(c)) }
+
+/// The equation source of `delim` at `open`, the text up to `close` and
+/// `delim` again, when that reads as one: not empty, not an amount
+/// (`$5 and $`), on boundaries, not in code or around an inline object.
+fn equation_between(t: &RichText, open: usize, close: usize, delim: &str) -> Option<String> {
+    let inner = &t.text[open + delim.len()..close];
+    let money = delim == "$" && inner.starts_with(|c: char| c.is_ascii_digit()) && !crate::paste::is_numeric_math(inner);
+    if money || inner.trim().is_empty()
+        || inner.starts_with('$')
+        || inner.ends_with('$')
+        || inner.contains(EQUATION)
+        || t.text[..open].ends_with('$')
+        || !md_boundary(t.text[..open].chars().next_back())
+        || !md_boundary(t.text[close + delim.len()..].chars().next())
+        || t.slice(open..close + delim.len()).runs.iter().any(|r| r.marks.code || r.marks.inline.is_some())
+    {
+        return None;
+    }
+    Some(crate::paste::markdown_equation_source(inner))
+}
+
+/// The `$x$` / `$$x$$` around `offset` (strictly between the pair, on one
+/// line) that `equation_between` reads as an equation: its range, where the
+/// source starts, and the source.
+fn equation_around(t: &RichText, offset: usize) -> Option<(Range<usize>, usize, String)> {
+    let line = t.text[..offset].rfind('\n').map_or(0, |i| i + 1)..t.text[offset..].find('\n').map_or(t.len(), |i| offset + i);
+    ["$$", "$"].into_iter().find_map(|delim| {
+        let open = line.start + t.text[line.start..offset].rfind(delim)?;
+        let close = offset + t.text[offset..line.end].find(delim)?;
+        if open + delim.len() > offset { return None; }
+        Some((open..close + delim.len(), open + delim.len(), equation_between(t, open, close, delim)?))
+    })
+}
+
+fn ascii_marker(prefix: &str) -> String {
+    if prefix == "—— " {
+        return "- ".into();
+    }
+    let (fence, rest) = match prefix.strip_prefix("···").or_else(|| prefix.strip_prefix("｀｀｀")) {
+        Some(rest) => ("```", rest),
+        None => ("", prefix),
+    };
+    let ascii = |c| match c {
+        '＃' => '#',
+        '－' => '-',
+        '＋' => '+',
+        '＊' => '*',
+        '＞' => '>',
+        '｜' => '|',
+        '．' => '.',
+        c => c,
+    };
+    fence.chars().chain(rest.chars().map(ascii)).collect()
+}
+
 /// A column goes once its last block does, and the
 /// others share its width in proportion.
 pub const MAX_COLUMNS: usize = 10;
@@ -3384,6 +3707,29 @@ mod tests {
         c.units()[n].id
     }
 
+    /// 右键: a click inside the selection keeps it, one outside replaces it.
+    #[test]
+    fn right_click_keeps_the_selection_it_lands_in() {
+        let mut c = doc("<title>t</title><p>one two</p><p>three four</p>");
+        let (a, b) = (id(&c, 1), id(&c, 2));
+        // A caret has nothing to keep.
+        c.sel = Selection::caret(Pos::new(a, 2));
+        assert!(!c.selection_holds(Pos::new(a, 2)));
+        // A selection across blocks: kept anywhere from its start to its end,
+        // in the middle block's whole length included.
+        c.sel = Selection { anchor: Pos::new(a, 4), head: Pos::new(b, 5) };
+        assert!(c.selection_holds(Pos::new(a, 4)));
+        assert!(c.selection_holds(Pos::new(a, 6)));
+        assert!(c.selection_holds(Pos::new(b, 3)));
+        assert!(!c.selection_holds(Pos::new(a, 1)));
+        assert!(!c.selection_holds(Pos::new(b, 7)));
+        // Whole blocks selected (handle click, Esc): kept on those blocks.
+        c.clear_block_sel();
+        c.select_block(a);
+        assert!(c.selection_holds(Pos::new(a, 0)));
+        assert!(!c.selection_holds(Pos::new(b, 0)));
+    }
+
     /// #220: a pasted web image relinked to its download, in tables too and
     /// across undo / redo, so stepping back never revives the expiring link.
     #[test]
@@ -3420,6 +3766,27 @@ mod tests {
         }
     }
 
+    /// A code block's fold is saved with the document, outside the edit history.
+    #[test]
+    fn code_folds_are_saved_not_undone() {
+        let mut c = doc("<title>T</title><p>a</p><pre lang=\"plaintext\"><code>x</code></pre>");
+        let code = id(&c, 2);
+        c.sel = Selection::caret(Pos::new(code, 1));
+        c.checkpoint(EditKind::Other);
+        c.insert_text("y");
+        assert!(c.set_code_folded(code, true));
+        assert!(!c.set_code_folded(code, true));
+        assert_eq!(c.block_sel_ids(), vec![code], "the caret leaves the hidden code");
+        assert!(xml(&c).contains("<pre lang=\"plaintext\" folded=\"true\"><code>xy</code></pre>"), "{}", xml(&c));
+        assert!(c.undo());
+        assert!(xml(&c).contains("<pre lang=\"plaintext\" folded=\"true\"><code>x</code></pre>"), "{}", xml(&c));
+        assert!(!c.set_code_folded(id(&c, 1), true), "only code blocks");
+        c.turn_into(&[code], BlockKind::Text);
+        assert!(!c.block(code).unwrap().folded, "{}", xml(&c));
+        let c = doc("<title>T</title><pre lang=\"plaintext\" folded=\"true\"><code>x</code></pre>");
+        assert_eq!(c.sel.head.block, TITLE, "opening never starts inside folded code");
+    }
+
     #[test]
     fn select_all_twice_deletes_a_folded_tail() {
         let mut c = doc("<title>T</title><h1>a</h1><h2 folded=\"true\">b</h2><p>hidden</p>");
@@ -3446,7 +3813,7 @@ mod tests {
     fn code_keeps_equations_as_source_and_never_holds_children() {
         let mut c = doc("<title>T</title><p>e <latex>x^2</latex><ul><li>kid</li></ul></p><p>b <b>bold</b></p>");
         let p = id(&c, 1);
-        c.turn_into(&[p], BlockKind::Code { lang: "plaintext".into(), caption: None, wrap: false });
+        c.turn_into(&[p], BlockKind::Code { lang: "plaintext".into(), caption: None, wrap: false, show_code: false });
         assert!(xml(&c).starts_with("<title>T</title>\n<pre lang=\"plaintext\"><code>e x^2</code></pre>\n<ul>"), "{}", xml(&c));
         // Deleting into code merges the tail as plain text, its children after the code block.
         let mut c = doc("<title>T</title><pre lang=\"plaintext\"><code>c</code></pre><p>b <b>bold</b><ul><li>kid</li></ul></p>");
@@ -3457,6 +3824,22 @@ mod tests {
         let mut c = doc("<title>T</title><hr/><p>a</p>");
         let (hr, a) = (id(&c, 1), id(&c, 2));
         assert!(!c.move_blocks(&[a], hr, DropPlace::FirstChild));
+    }
+
+    /// #237: the unused-asset sweep reads the disk, so an editor has to say
+    /// what it can still bring back — the document, and the snapshots behind it.
+    #[test]
+    fn asset_refs_keep_a_picture_undo_can_bring_back() {
+        let mut c = doc("<title>T</title><img src=\"/lib/.assets/a.png\"/><p>x</p>");
+        assert_eq!(c.asset_refs(), ["/lib/.assets/a.png".to_string()]);
+        c.delete_block(id(&c, 1));
+        assert!(!c.asset_refs().is_empty(), "the picture is one Undo away");
+        assert!(c.asset_refs().iter().any(|s| s.ends_with("a.png")));
+        assert!(c.undo());
+        assert_eq!(c.asset_refs(), ["/lib/.assets/a.png".to_string()]);
+        // The cover is a file of the library's assets as much as a picture is.
+        let c = doc("<title cover=\".assets/c.png\">T</title><p>x</p>");
+        assert_eq!(c.asset_refs(), [".assets/c.png".to_string()]);
     }
 
     #[test]
@@ -3472,6 +3855,33 @@ mod tests {
         assert!(c.block(h).unwrap().folded);
         assert_eq!(c.doc.icon.as_deref(), Some("🐱"));
         assert!(xml(&c).contains("<p>a</p>"), "{}", xml(&c));
+    }
+
+    /// Side drops preserve images and captions across new/existing grids and undo.
+    #[test]
+    fn image_side_drop_creates_and_extends_grid() {
+        for before in [false, true] {
+            let mut c = doc("<img src=\"a.png\" caption=\"A\"/><p>Middle</p><img src=\"b.png\" caption=\"B\"/><img src=\"c.png\"/>");
+            let (a, b, third) = (c.doc.blocks[0].id, c.doc.blocks[2].id, c.doc.blocks[3].id);
+            let original = xml(&c);
+            assert!(!c.move_image_beside(a, a, before));
+            assert!(c.move_image_beside(b, a, before));
+            let g = &c.doc.blocks[0];
+            assert_eq!(g.children[usize::from(!before)].children[0].id, b);
+            let pair = xml(&c);
+            c.undo();
+            assert_eq!(xml(&c), original);
+            c.redo();
+            assert_eq!(xml(&c), pair);
+            assert!(c.move_image_beside(third, a, before));
+            assert_eq!(c.doc.blocks[0].children.len(), 3);
+            assert!(c.move_image_beside(b, third, before));
+            assert_eq!(c.doc.blocks[0].children.len(), 3);
+            let saved = xml(&c);
+            assert_eq!(crate::docxml::serialize(&crate::docxml::parse(&saved).unwrap()), saved);
+            assert_eq!(c.block(a).unwrap().id, a);
+            assert_eq!(c.block(b).unwrap().id, b);
+        }
     }
 
     #[test]
@@ -3558,6 +3968,51 @@ mod tests {
         assert_eq!(c.units().len(), 3);
         c.enter();
         assert_eq!(xml(&c), "<title>T</title>\n<h1 folded=\"true\">A</h1>\n<p>a1</p>\n<h2>B</h2>\n<p>b1</p>\n<h1></h1>\n<h1>C</h1>\n");
+    }
+
+    #[test]
+    fn backspace_at_body_start_stays_in_body() {
+        // Text, empty or not, never goes into the title, and no undo step is spent.
+        for body in ["abc", ""] {
+            let mut c = doc(&format!("<title>T</title><p>{body}</p>"));
+            let b = id(&c, 1);
+            c.sel = Selection::caret(Pos::new(b, 0));
+            let steps = c.undo.len();
+            c.backspace();
+            c.delete_to_start();
+            assert_eq!(xml(&c), format!("<title>T</title>\n<p>{body}</p>\n"));
+            assert_eq!(c.sel.head, Pos::new(b, 0));
+            assert_eq!(c.undo.len(), steps);
+        }
+        // An empty first line goes when text follows, caret moves down.
+        let mut c = doc("<title>T</title><p></p><h2>x</h2>");
+        c.sel = Selection::caret(Pos::new(id(&c, 1), 0));
+        c.backspace();
+        assert_eq!(xml(&c), "<title>T</title>\n<h2>x</h2>\n");
+        assert_eq!(c.sel.head, Pos::new(id(&c, 1), 0));
+        // Formatted blocks first turn into a paragraph, then stay put.
+        for src in ["<ul><li>a</li></ul>", "<h1>a</h1>", "<blockquote><p>a</p></blockquote>", "<checkbox done=\"false\">a</checkbox>"] {
+            let mut c = doc(&format!("<title>T</title>{src}"));
+            let first = c.units()[1].id;
+            c.sel = Selection::caret(Pos::new(first, 0));
+            c.backspace();
+            assert_eq!(xml(&c), "<title>T</title>\n<p>a</p>\n", "{src}");
+            c.backspace();
+            assert_eq!(xml(&c), "<title>T</title>\n<p>a</p>\n", "{src}");
+            assert_ne!(c.sel.head.block, TITLE);
+        }
+        // 退格键回到标题 brings the old merge back.
+        let mut c = doc("<title>T</title><p>a</p>");
+        c.backspace_to_title = true;
+        c.sel = Selection::caret(Pos::new(id(&c, 1), 0));
+        c.backspace();
+        assert_eq!(c.doc.title.text, "Ta");
+        assert_eq!(c.sel.head, Pos::new(TITLE, 1));
+        // Delete at the end of the title still pulls the body up.
+        let mut c = doc("<title>T</title><p>a</p><p>b</p>");
+        c.sel = Selection::caret(Pos::new(TITLE, 1));
+        c.delete_forward();
+        assert_eq!(xml(&c), "<title>Ta</title>\n<p>b</p>\n");
     }
 
     #[test]
@@ -3732,6 +4187,39 @@ mod tests {
         assert!(xml(&c).contains("<p>见 <a href=\"https://www.a.com/x\">www.a.com/x</a>). https:// </p>"), "{}", xml(&c));
     }
 
+    /// 中英文之间自动加空格 (#293): typing, IME commits of several characters,
+    /// code blocks left alone; 整理本文空格 over title, folded, table and nested
+    /// text in one undo step, the caret kept on its character.
+    #[test]
+    fn cjk_spacing_typed_and_whole_document() {
+        let mut c = doc("<title>T</title><p>用</p><pre lang=\"go\"><code>中a</code></pre>");
+        let b = id(&c, 1);
+        c.sel = Selection::caret(Pos::new(b, "用".len()));
+        for s in ["i", "Phone", "拍了3张", " ", "a"] {
+            c.insert_text(s);
+            c.space_typed(s.len());
+        }
+        assert_eq!(c.text_of(b).unwrap().text, "用 iPhone 拍了 3 张 a");
+        assert_eq!(c.sel.head.offset, c.text_of(b).unwrap().len());
+        let code = id(&c, 2);
+        c.sel = Selection::caret(Pos::new(code, "中a".len()));
+        c.insert_text("文");
+        assert!(!c.space_typed("文".len()));
+        assert_eq!(c.text_of(code).unwrap().text, "中a文");
+
+        let mut c = doc("<title>标题v2</title><h2 folded=\"true\">折叠a</h2><p>藏b</p><table><tr><td><p>格c</p></td></tr></table><ul><li>一<ul><li>二d</li></ul></li></ul><pre><code>码e</code></pre>");
+        let b = id(&c, 1);
+        c.sel = Selection::caret(Pos::new(b, "折叠a".len()));
+        let before = xml(&c);
+        assert_eq!(c.space_document(), 5);
+        let after = xml(&c);
+        for t in ["标题 v2", "折叠 a", "藏 b", "格 c", "二 d", "码e"] { assert!(after.contains(t), "{t}: {after}"); }
+        assert_eq!(c.sel.head.offset, "折叠 a".len());
+        assert_eq!(c.space_document(), 0);
+        c.undo();
+        assert_eq!(xml(&c), before);
+    }
+
     #[test]
     fn list_enter_on_empty_exits() {
         let mut c = doc("<title>T</title><ul><li>a</li></ul>");
@@ -3786,6 +4274,69 @@ mod tests {
                 None => assert!(!t.contains(EQUATION), "{typed_text}"),
             }
         }
+    }
+
+    /// #69: `$$` (or `$$$$`) typed first, the caret moved between them and the
+    /// source typed there: an equation once the caret leaves, not before.
+    #[test]
+    fn equation_delimiters_first() {
+        for (pair, inside, source) in [("$$", 1, "X_t"), ("$$$$", 2, "\\frac{a}{b}")] {
+            for after in ["", " cd"] {
+                let mut c = doc("<title>T</title><p></p>");
+                let b = id(&c, 1);
+                c.sel = Selection::caret(Pos::new(b, 0));
+                typed(&mut c, &format!("ab {pair}{after}"));
+                c.sel = Selection::caret(Pos::new(b, 3 + inside));
+                typed(&mut c, source);
+                assert!(!c.equation_on_leave(), "still inside");
+                assert!(!c.text_of(b).unwrap().text.contains(EQUATION));
+                let raw = c.text_of(b).unwrap().text.clone();
+                c.sel = Selection::caret(Pos::new(b, raw.len()));
+                assert!(c.equation_on_leave());
+                assert_eq!(c.equation_source(Pos::new(b, 3)).as_deref(), Some(source.replace("\\\\", "\\").as_str()));
+                assert_eq!(c.text_of(b).unwrap().text, format!("ab {EQUATION}{after}"));
+                assert_eq!(c.sel.head.offset, c.text_of(b).unwrap().len(), "the caret stays after the text");
+                assert!(!c.equation_on_leave(), "once");
+                c.undo();
+                assert_eq!(c.text_of(b).unwrap().text, raw);
+            }
+        }
+        // Left by moving before the pair: the caret keeps its place.
+        let mut c = doc("<title>T</title><p></p>");
+        let b = id(&c, 1);
+        c.sel = Selection::caret(Pos::new(b, 0));
+        typed(&mut c, "ab $$");
+        c.sel = Selection::caret(Pos::new(b, 4));
+        typed(&mut c, "y");
+        c.sel = Selection::caret(Pos::new(b, 1));
+        assert!(c.equation_on_leave());
+        assert_eq!(c.sel.head.offset, 1);
+        assert_eq!(c.equation_source(Pos::new(b, 3)).as_deref(), Some("y"));
+    }
+
+    /// What the typed closing `$` leaves alone stays text this way too: an
+    /// amount, no boundary, an empty pair, a pair nobody typed in.
+    #[test]
+    fn equation_delimiters_first_rules() {
+        for (text, inside, typed_in) in [("$$", 1, "5 and 6 "), ("x$$", 2, "a"), ("$ $", 1, "")] {
+            let mut c = doc("<title>T</title><p></p>");
+            let b = id(&c, 1);
+            c.sel = Selection::caret(Pos::new(b, 0));
+            typed(&mut c, text);
+            c.sel = Selection::caret(Pos::new(b, inside));
+            typed(&mut c, typed_in);
+            let len = c.text_of(b).unwrap().len();
+            c.sel = Selection::caret(Pos::new(b, len));
+            assert!(!c.equation_on_leave(), "{text} {typed_in}");
+            assert!(!c.text_of(b).unwrap().text.contains(EQUATION), "{text} {typed_in}");
+        }
+        let mut c = doc("<title>T</title><p>$a$ b</p>");
+        let b = id(&c, 1);
+        // The caret only passing through: nothing typed between the pair.
+        c.sel = Selection::caret(Pos::new(b, 1));
+        assert!(!c.equation_on_leave());
+        c.sel = Selection::caret(Pos::new(b, 5));
+        assert!(!c.equation_on_leave());
     }
 
     #[test]
@@ -3979,11 +4530,75 @@ mod tests {
             typed(&mut c, input);
             assert!(xml(&c).contains(want), "{input:?} -> {}", xml(&c));
         }
+        // Full-width markers from a Chinese input method, then a half-width space.
+        for (input, want) in [
+            ("＃ ", "<h1>"),
+            ("＃＃＃ ", "<h3>"),
+            ("－ ", "<ul>\n  <li></li>\n</ul>"),
+            ("＋ ", "<ul>\n  <li></li>\n</ul>"),
+            ("＊ ", "<ul>\n  <li></li>\n</ul>"),
+            ("—— ", "<ul>\n  <li></li>\n</ul>"),
+            ("1． ", "<ol>\n  <li></li>\n</ol>"),
+            ("3． ", "<ol>\n  <li seq=\"3\"></li>\n</ol>"),
+            ("＞ ", "<blockquote>"),
+            ("｜ ", "<blockquote>"),
+            ("···rust ", "<pre lang=\"rust\""),
+        ] {
+            let mut c = doc("<title>T</title><p></p>");
+            let b = id(&c, 1);
+            c.sel = Selection::caret(Pos::new(b, 0));
+            typed(&mut c, input);
+            assert!(xml(&c).contains(want), "{input:?} -> {}", xml(&c));
+            assert!(!xml(&c).contains(input.trim_end()), "{input:?} -> {}", xml(&c));
+        }
+        // Not a marker: full-width text stays as typed.
+        for input in ["＃标题 ", "——破折号 ", "中＃ ", "1．5 ", "· ", "·· "] {
+            let mut c = doc("<title>T</title><p></p>");
+            c.sel = Selection::caret(Pos::new(id(&c, 1), 0));
+            typed(&mut c, input);
+            assert_eq!(xml(&c), format!("<title>T</title>\n<p>{input}</p>\n"), "{input:?}");
+        }
         // "[x] " stays literal.
         let mut c = doc("<title>T</title><p></p>");
         c.sel = Selection::caret(Pos::new(id(&c, 1), 0));
         typed(&mut c, "[x] ");
         assert!(xml(&c).contains("<p>[x] </p>"), "{}", xml(&c));
+    }
+
+    #[test]
+    fn markdown_full_width_markers() {
+        // Typed in front of existing text: the text stays, ⌘Z brings back the marker as typed.
+        let mut c = doc("<title>T</title><p>a<b>bc</b></p>");
+        let b = id(&c, 1);
+        c.sel = Selection::caret(Pos::new(b, 0));
+        typed(&mut c, "＃＃ ");
+        assert_eq!(xml(&c), "<title>T</title>\n<h2>a<b>bc</b></h2>\n");
+        c.undo();
+        assert_eq!(xml(&c), "<title>T</title>\n<p>＃＃ a<b>bc</b></p>\n");
+        // Mid-paragraph is not a line start.
+        let mut c = doc("<title>T</title><p>中文</p>");
+        let b = id(&c, 1);
+        c.sel = Selection::caret(Pos::new(b, "中".len()));
+        typed(&mut c, "＞ ");
+        assert_eq!(xml(&c), "<title>T</title>\n<p>中＞ 文</p>\n");
+        // "···lang" + Enter, like "```lang" + Enter; the text after the caret stays.
+        let mut c = doc("<title>T</title><p>x</p>");
+        let b = id(&c, 1);
+        c.sel = Selection::caret(Pos::new(b, 0));
+        typed(&mut c, "···java");
+        assert!(c.markdown_enter_shortcut());
+        assert!(matches!(c.kind_of(b), Some(BlockKind::Code { lang, .. }) if lang == "Java"), "{}", xml(&c));
+        assert_eq!(c.text_of(b).unwrap().text, "x");
+        let mut c = doc("<title>T</title><p></p>");
+        c.sel = Selection::caret(Pos::new(id(&c, 1), 0));
+        typed(&mut c, "··java");
+        assert!(!c.markdown_enter_shortcut());
+        // Not in a table cell, as with "| ".
+        let mut c = doc("<title>T</title><table><tr><td></td></tr></table>");
+        let cell = c.units().into_iter().find(|u| u.id != TITLE).unwrap().id;
+        c.sel = Selection::caret(Pos::new(cell, 0));
+        typed(&mut c, "｜ ");
+        assert_eq!(c.text_of(cell).unwrap().text, "｜ ");
     }
 
     #[test]
@@ -4069,6 +4684,35 @@ mod tests {
         let p = c.insert_equation("X_t").unwrap();
         c.sel = Selection { anchor: Pos::new(b, 0), head: Pos::new(b, p.offset + EQUATION.len() + 1) };
         assert_eq!(c.selected_text(), "aX_tb");
+    }
+
+    #[test]
+    fn selection_to_equation() {
+        let mut c = doc("<title>T</title><p>a <b>x^2</b><code>+1</code> b</p><p>c</p><pre lang=\"plaintext\"><code>y</code></pre>");
+        let (b, cb, code) = (id(&c, 1), id(&c, 2), id(&c, 3));
+        let before = xml(&c);
+        c.sel = Selection { anchor: Pos::new(b, 7), head: Pos::new(b, 2) };
+        assert_eq!(c.selection_equation_source().as_deref(), Some("x^2+1"));
+        let p = c.selection_to_equation().unwrap();
+        assert_eq!(p, Pos::new(b, 2));
+        assert_eq!(c.equation_source(p).as_deref(), Some("x^2+1"));
+        assert_eq!(c.sel, Selection::caret(Pos::new(b, 2 + EQUATION.len())));
+        let after = xml(&c);
+        assert!(after.contains("<p>a <latex>x^2+1</latex> b</p>"), "{after}");
+        // Markdown keeps it as `$...$`, and reads it back as the same equation.
+        let md = crate::markdown::write_file(&c.doc, "", None);
+        assert!(md.contains("a $x^2+1$ b"), "{md}");
+        let back = crate::markdown::parse_file(&md, "T", None);
+        assert_eq!(crate::markdown::write_file(&back, "", None), md);
+        assert_eq!(back.blocks[0].text.runs.iter().find_map(|r| r.marks.inline.as_ref()?.equation().map(str::to_string)).as_deref(), Some("x^2+1"));
+        // The equation itself, across blocks, blank, in code: refused.
+        for (a, h) in [(Pos::new(b, 2), Pos::new(b, 2 + EQUATION.len())), (Pos::new(b, 0), Pos::new(cb, 1)), (Pos::new(b, 1), Pos::new(b, 2)), (Pos::new(code, 0), Pos::new(code, 1))] {
+            c.sel = Selection { anchor: a, head: h };
+            assert!(c.selection_to_equation().is_none());
+        }
+        assert_eq!(xml(&c), after);
+        c.undo();
+        assert_eq!(xml(&c), before);
     }
 
     #[test]

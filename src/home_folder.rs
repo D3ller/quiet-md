@@ -9,6 +9,7 @@
 //! another while the front leans back; a dragged card turns into a paper,
 //! the folder opens its mouth under it, and a drop slides it in behind the
 //! glass while the folder dips.
+use fdl_core::vfs::PathExt as _;
 use crate::app::{RowMenu, Workspace};
 use crate::settings::display_title;
 use crate::sidebar_drag::{Fade, Spring};
@@ -16,7 +17,8 @@ use crate::store::Entry;
 use crate::theme::{self, Theme, craft, ca};
 use crate::ui::{TipExt, icon, ui_text};
 use gpui::{prelude::FluentBuilder, *};
-use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Instant};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use web_time::Instant;
 
 /// The tab's share of a folder card's height: the folder's body is a document
 /// card's size, the tab rises above it (`home.rs` lowers the cards beside it).
@@ -37,7 +39,15 @@ pub(crate) struct HomeFolders {
     pub(crate) file_drop: Option<FileDrop>,
     /// Last-frame window bounds of the folder and document cards, by entry id.
     bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
+    /// The folder cards' papers and counts, kept while the entries hold (`Entries::generation`).
+    papers: RefCell<Papers>,
 }
+
+/// Each folder's children (indices into the entries, in their order), and
+/// each card's papers and count by (folder, front paper). Looking for a
+/// card's papers walked every entry once per folder under it, each frame.
+#[derive(Default)]
+struct Papers { key: Option<u64>, children: HashMap<String, Vec<usize>>, cards: HashMap<(String, Option<String>), (Vec<Entry>, usize)> }
 
 struct FolderFx {
     /// Hover: the papers rise, the front leans back.
@@ -117,7 +127,7 @@ fn seed(id: &str) -> u64 {
 }
 
 /// A rounded rectangle turned by `rot` about its centre (card-local `c`, painted at `o`).
-fn rounded(o: Point<Pixels>, c: (f32, f32), w: f32, h: f32, r: f32, rot: f32) -> Option<Path<Pixels>> {
+fn rounded(o: Point<Pixels>, c: (f32, f32), w: f32, h: f32, r: f32, rot: f32) -> Option<Path> {
     let mut pb = PathBuilder::fill();
     append_rounded(&mut pb, o, c, w, h, r, rot);
     pb.build().ok()
@@ -150,7 +160,7 @@ impl Paper {
     /// lies on it, lines of "text" (below a real title when `titled`).
     fn paint(&self, o: Point<Pixels>, face: Face, window: &mut Window) {
         let b = Bounds::new(o + point(px(self.cx - self.w / 2.), px(self.cy - self.h / 2.)), size(px(self.w), px(self.h)));
-        window.paint_shadows(b, Corners::all(px(10.)), &[BoxShadow { color: theme::rgbaf(0, 0, 0, if theme::dark() { 0.3 } else { 0.07 }), offset: point(px(0.), px(3.)), blur_radius: px(10.), spread_radius: px(0.) }]);
+        window.paint_drop_shadows(b, Corners::all(px(10.)), &[BoxShadow { color: theme::rgbaf(0, 0, 0, if theme::dark() { 0.3 } else { 0.07 }), offset: point(px(0.), px(3.)), blur_radius: px(10.), spread_radius: px(0.), inset: false }]);
         if let Some(p) = rounded(o, (self.cx, self.cy), self.w + 1., self.h + 1., 10.5, self.rot) { window.paint_path(p, ca(craft::N1000, 0.08)); }
         if let Some(p) = rounded(o, (self.cx, self.cy), self.w, self.h, 10., self.rot) { window.paint_path(p, theme::raised(Theme::bg_body())); }
         let mut rng = self.seed;
@@ -218,8 +228,8 @@ fn glass(o: Point<Pixels>, p: &Pose, window: &mut Window) {
     };
     // The whole folder's shadow sits under the front.
     let lift = -p.lift / 4.;
-    window.paint_shadows(Bounds::new(pt(6., yr + 10.), size(px(w - 12.), px(h - yr - 10.))), Corners::all(px(r)),
-        &[BoxShadow { color: theme::rgbaf(0, 0, 0, if theme::dark() { 0.35 } else { 0.06 + 0.04 * lift }), offset: point(px(0.), px(8. + 6. * lift)), blur_radius: px(22. + 10. * lift), spread_radius: px(-2.) }]);
+    window.paint_drop_shadows(Bounds::new(pt(6., yr + 10.), size(px(w - 12.), px(h - yr - 10.))), Corners::all(px(r)),
+        &[BoxShadow { color: theme::rgbaf(0, 0, 0, if theme::dark() { 0.35 } else { 0.06 + 0.04 * lift }), offset: point(px(0.), px(8. + 6. * lift)), blur_radius: px(22. + 10. * lift), spread_radius: px(-2.), inset: false }]);
     let mut pb = PathBuilder::fill();
     edge(&mut pb);
     pb.line_to(pt(w, h - r));
@@ -250,33 +260,45 @@ fn glass(o: Point<Pixels>, p: &Pose, window: &mut Window) {
 
 impl Workspace {
     fn folder_papers(&self, id: &str, front: Option<&String>) -> (Vec<Entry>, usize) {
-        let n = self.entries.iter().filter(|e| e.meta.parent.as_deref() == Some(id)).count();
+        let key = self.entries.generation();
+        let mut p = self.home.folders.papers.borrow_mut();
+        if p.key != Some(key) {
+            let mut children: HashMap<String, Vec<usize>> = HashMap::new();
+            for (i, e) in self.entries.iter().enumerate() {
+                if let Some(parent) = &e.meta.parent { children.entry(parent.clone()).or_default().push(i); }
+            }
+            *p = Papers { key: Some(key), children, cards: HashMap::new() };
+        }
+        if let Some(c) = p.cards.get(&(id.to_string(), front.cloned())) { return c.clone(); }
+        let n = p.children.get(id).map_or(0, Vec::len);
         // Papers stand for documents. A folder drawn as a paper reads as a note
         // with the folder's name on it, so only documents are painted — but a
         // folder usually holds folders for a while before a document appears,
         // and its documents usually sit deeper, so look all the way down and
         // paint the newest ones (#123).
-        let mut kids: Vec<Entry> = vec![];
-        self.documents_below(id, &mut kids, 0);
+        let mut kids: Vec<&Entry> = vec![];
+        self.documents_below(&p.children, id, &mut kids, 0);
         kids.sort_by(|a, b| {
             let lead = |e: &Entry| front.is_some_and(|f| *f == e.id);
             lead(b).cmp(&lead(a)).then(b.meta.opened.max(b.meta.modified).cmp(&a.meta.opened.max(a.meta.modified)))
         });
-        kids.truncate(PAPERS);
-        (kids, n)
+        let card = (kids.into_iter().take(PAPERS).cloned().collect(), n);
+        p.cards.insert((id.to_string(), front.cloned()), card.clone());
+        card
     }
 
     /// Every document anywhere under `id`, newest first once sorted by the caller.
-    fn documents_below(&self, id: &str, out: &mut Vec<Entry>, depth: usize) {
+    fn documents_below<'a>(&'a self, children: &HashMap<String, Vec<usize>>, id: &str, out: &mut Vec<&'a Entry>, depth: usize) {
         // A folder that contains itself would otherwise recurse forever.
         if depth > 32 {
             return;
         }
-        for e in self.entries.iter().filter(|e| e.meta.parent.as_deref() == Some(id)) {
+        for &i in children.get(id).map_or(&[][..], Vec::as_slice) {
+            let e = &self.entries[i];
             if e.meta.folder.is_some() {
-                self.documents_below(&e.id, out, depth + 1);
+                self.documents_below(children, &e.id, out, depth + 1);
             } else {
-                out.push(e.clone());
+                out.push(e);
             }
         }
     }
@@ -364,14 +386,13 @@ impl Workspace {
                 .child(div().text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_caption())
                     .child(crate::localized_count!(count, "{} 项", "{} item", "{} items", count))))
             .when(self.batch.is_none(), |d| d
-                .child(div().id(SharedString::from(format!("home-fnew-{id}"))).flex_none().size(px(28.)).rounded_full().flex().items_center().justify_center()
-                    .bg(theme::raised(Theme::bg_body())).shadow(theme::shadow_button()).opacity(reveal).cursor_pointer()
-                    .hover(|s| s.bg(Theme::fill_hover_strong()))
+                // Outline buttons floating on the tile, round.
+                .child(crate::design::Button::outline(SharedString::from(format!("home-fnew-{id}"))).sized(crate::design::ButtonSize::Tool).rounded_full().opacity(reveal)
                     .tip(crate::settings::tr("新建文档", "New document"), None)
-                    .child(icon("plus", 15., Theme::icon()).with_transformation(Transformation::scale(size(0.7 + 0.3 * reveal, 0.7 + 0.3 * reveal))))
+                    .child(crate::design::icon("plus", 16., crate::design::color::muted_foreground()).with_transformation(Transformation::scale(size(0.7 + 0.3 * reveal, 0.7 + 0.3 * reveal))))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |w, _, window, cx| { cx.stop_propagation(); w.new_child(&new_id, window, cx); })))
-                .child(self.home_more(e, format!("home-fmore-{id}"), cx).size(px(28.)).rounded_full().bg(theme::raised(Theme::bg_body())).shadow(theme::shadow_button()).opacity(reveal)));
+                .child(self.home_more(e, format!("home-fmore-{id}"), cx).variant(crate::design::ButtonVariant::Outline).sized(crate::design::ButtonSize::Tool).rounded_full().opacity(reveal)));
         div().id(SharedString::from(format!("home-folder-{id}"))).relative().w_full().min_w_0().h(px(h)).cursor_pointer()
             .when(self.batch.is_some(), |d| d.opacity(0.45))
             .on_hover(cx.listener(move |w, on: &bool, _, cx| {
@@ -387,7 +408,7 @@ impl Workspace {
             .when(self.batch.is_none(), |d| d
                 .on_click(cx.listener(move |w, _, window, cx| { w.try_open(&open_id, window, cx); }))
                 .on_mouse_down(MouseButton::Right, cx.listener(move |w, ev: &MouseDownEvent, _, cx| {
-                    w.row_menu = Some(RowMenu { id: menu_id.clone(), pos: ev.position, corner: Corner::TopLeft, sub: false, batch: false });
+                    w.row_menu = Some(RowMenu { id: menu_id.clone(), pos: ev.position, corner: Anchor::TopLeft, sub: false, batch: false, from: None });
                     cx.notify();
                 })))
             .child(back).children(title).child(front_glass).child(label)
@@ -430,8 +451,8 @@ impl Workspace {
     fn move_home_drag(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
         if !self.home.folders.drag.as_ref().is_some_and(|d| d.started && !d.returning) { return; }
         // Only folders on the page now: bounds linger for cards of pages left behind.
-        let shown = if self.view == crate::app::View::Folder { self.level_entries(self.folder_current.as_deref()) } else { self.home_entries() };
-        let over = shown.iter().filter(|e| e.meta.folder.is_some())
+        let shown = if self.view == crate::app::View::Folder { self.page_entries(self.folder_current.as_deref()) } else { self.home_entries() };
+        let over = shown.iter().filter(|e| e.meta.folder.is_some() && e.note.is_none())
             .find(|e| self.home.folders.bounds.borrow().get(&e.id).is_some_and(|b| b.contains(&at)))
             .map(|e| e.id.clone());
         let Some(d) = self.home.folders.drag.as_mut() else { return };
@@ -529,6 +550,8 @@ pub(crate) struct FileDrop {
     paths: Vec<std::path::PathBuf>,
     md: usize,
     xml: usize,
+    /// CSV / TSV: each becomes a 数据表.
+    csv: usize,
     dirs: usize,
     other: usize,
     at: Point<Pixels>,
@@ -561,15 +584,16 @@ const ART_H: f32 = 168.;
 
 impl FileDrop {
     fn new(paths: Vec<std::path::PathBuf>) -> Self {
-        let (mut md, mut xml, mut dirs, mut other) = (0, 0, 0, 0);
+        let (mut md, mut xml, mut csv, mut dirs, mut other) = (0, 0, 0, 0, 0);
         for p in &paths {
-            if p.is_dir() { dirs += 1; }
+            if p.fs_is_dir() { dirs += 1; }
             else if crate::local_files::is_markdown_path(p) { md += 1; }
             else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("xml")) { xml += 1; }
+            else if crate::transfer::is_csv_path(p) { csv += 1; }
             else { other += 1; }
         }
         Self {
-            paths, md, xml, dirs, other, at: point(px(0.), px(0.)), over: None, zone: Default::default(), inside: false, drop_at: point(px(0.), px(0.)),
+            paths, md, xml, csv, dirs, other, at: point(px(0.), px(0.)), over: None, zone: Default::default(), inside: false, drop_at: point(px(0.), px(0.)),
             show: Fade::new(0., 240., 21.), veil: Fade::new(0., 160., 25.), arm: Fade::new(0., 300., 23.),
             dip: Fade::new(0., 520., 15.), land: Fade::new(0., 150., 21.), shake: Fade::new(0., 700., 9.),
             // Each paper surfaces a little after the one in front.
@@ -578,7 +602,7 @@ impl FileDrop {
         }
     }
 
-    fn importable(&self) -> usize { self.md + self.xml + self.dirs }
+    fn importable(&self) -> usize { self.md + self.xml + self.csv + self.dirs }
 
     /// The pointer went somewhere else that takes the drop (the sidebar).
     pub(crate) fn leave(&mut self) { if self.landed.is_none() { self.leaving = true; } }
@@ -588,6 +612,7 @@ impl FileDrop {
         let mut parts = vec![];
         if self.md > 0 { parts.push(crate::localized_count!(self.md, "{} 个 Markdown 文件", "{} Markdown file", "{} Markdown files", self.md)); }
         if self.xml > 0 { parts.push(crate::localized_count!(self.xml, "{} 个 DocxXML 文件", "{} DocxXML file", "{} DocxXML files", self.xml)); }
+        if self.csv > 0 { parts.push(crate::localized_count!(self.csv, "{} 个 CSV 文件", "{} CSV file", "{} CSV files", self.csv)); }
         if self.dirs > 0 { parts.push(crate::localized_count!(self.dirs, "{} 个文件夹", "{} folder", "{} folders", self.dirs)); }
         if self.other > 0 && !parts.is_empty() { parts.push(crate::localized_format!("{} 个不支持的文件会被跳过", "{} unsupported skipped", self.other)); }
         parts.join(" · ")
@@ -595,7 +620,7 @@ impl FileDrop {
 
     /// The front paper's tag: what kind of file leads.
     fn tag(&self) -> Option<&'static str> {
-        if self.md > 0 { Some("MD") } else if self.xml > 0 { Some("XML") } else { None }
+        if self.md > 0 { Some("MD") } else if self.xml > 0 { Some("XML") } else if self.csv > 0 { Some("CSV") } else { None }
     }
 }
 
@@ -617,8 +642,8 @@ impl Workspace {
         if !matches!(self.view, crate::app::View::Home | crate::app::View::Folder) { return; }
         let fresh = self.home.folders.file_drop.as_ref().is_none_or(|d| d.landed.is_some());
         if fresh { self.home.folders.file_drop = Some(FileDrop::new(paths)); }
-        let shown = if self.view == crate::app::View::Folder { self.level_entries(self.folder_current.as_deref()) } else { self.home_entries() };
-        let over = shown.iter().filter(|e| e.meta.folder.is_some())
+        let shown = if self.view == crate::app::View::Folder { self.page_entries(self.folder_current.as_deref()) } else { self.home_entries() };
+        let over = shown.iter().filter(|e| e.meta.folder.is_some() && e.note.is_none())
             .find(|e| self.home.folders.bounds.borrow().get(&e.id).is_some_and(|b| b.contains(&at)))
             .map(|e| e.id.clone());
         let Some(d) = self.home.folders.file_drop.as_mut() else { return };
@@ -641,6 +666,13 @@ impl Workspace {
 
     pub(crate) fn file_drop_paths(&mut self, paths: Vec<std::path::PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.view, crate::app::View::Home | crate::app::View::Folder) { return; }
+        // The first listing still running: Markdown files and folders open where they are, as from the Finder.
+        if self.store.loading() {
+            self.home.folders.file_drop = None;
+            let open: Vec<_> = paths.into_iter().filter(|p| p.fs_is_dir() || crate::local_files::is_markdown_path(p)).collect();
+            if open.is_empty() { self.still_loading(cx); } else { self.open_paths(&open, window, cx); }
+            return;
+        }
         if self.home.folders.file_drop.is_none() { self.home.folders.file_drop = Some(FileDrop::new(paths)); }
         let page = if self.view == crate::app::View::Folder { self.folder_current.clone() } else { None };
         let Some(d) = self.home.folders.file_drop.as_mut() else { return };
@@ -656,7 +688,7 @@ impl Workspace {
         d.land.to = 1.;
         d.dip.v += 5.5;
         if let Some(f) = d.over.as_ref().and_then(|k| self.home.folders.fx.get_mut(k)) { f.dip.v += 5.5; }
-        let (dirs, files): (Vec<_>, Vec<_>) = d.paths.iter().cloned().partition(|p| p.is_dir());
+        let (dirs, files): (Vec<_>, Vec<_>) = d.paths.iter().cloned().partition(|p| p.fs_is_dir());
         let files: Vec<_> = files.into_iter().filter(|p| crate::local_files::is_markdown_path(p) || p.extension().is_some_and(|x| x.eq_ignore_ascii_case("xml"))).collect();
         if !files.is_empty() { self.import_paths(&files, target.clone(), false, window, cx); }
         for dir in &dirs { self.import_folder(dir, target.clone(), false, window, cx); }
@@ -672,7 +704,7 @@ impl Workspace {
         if !matches!(self.view, crate::app::View::Home | crate::app::View::Folder) { self.home.folders.file_drop = None; return None; }
         let dragging = cx.has_active_drag() || crate::devtools::file_drag();
         let target_title = |w: &Self, id: Option<&String>| id.and_then(|id| w.entries.iter().find(|e| &e.id == id)).map(|e| display_title(&e.title))
-            .unwrap_or_else(|| crate::settings::tr("我的文档", "My documents").to_string());
+            .unwrap_or_else(|| w.home_name());
         let page = if self.view == crate::app::View::Folder { self.folder_current.clone() } else { None };
         let d = self.home.folders.file_drop.as_ref()?;
         let place = target_title(self, d.landed.clone().flatten().as_ref().or(d.over.as_ref()).or(page.as_ref()));
@@ -733,7 +765,7 @@ impl Workspace {
         let pose = Pose { w, h, lift, open: o, yl: 0.49 * h + lean, yr: 0.54 * h + lean, inset: -(3. * o + 7. * m), papers };
         let tag = d.tag();
         // The front paper's name: the first file of the kind it shows.
-        let first = d.paths.iter().find(|p| match tag { Some("MD") => crate::local_files::is_markdown_path(p), Some(_) => p.extension().is_some_and(|x| x.eq_ignore_ascii_case("xml")), None => p.is_dir() })
+        let first = d.paths.iter().find(|p| match tag { Some("MD") => crate::local_files::is_markdown_path(p), Some("CSV") => crate::transfer::is_csv_path(p), Some(_) => p.extension().is_some_and(|x| x.eq_ignore_ascii_case("xml")), None => p.fs_is_dir() })
             .or(d.paths.first()).and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let summary = d.summary();
         let record = d.zone.clone();
@@ -745,11 +777,11 @@ impl Workspace {
         let (title, sub) = if reject {
             (crate::settings::tr("这些文件不能导入", "These files can't be imported").to_string(), crate::settings::tr("支持 Markdown、DocxXML 文件和文件夹", "Markdown, DocxXML files and folders are supported").to_string())
         } else if d.landed.is_some() {
-            (crate::localized_format!("已导入到「{}」", "Imported into “{}”", place), summary)
-        } else if over {
-            (crate::localized_format!("松手放入「{}」", "Release to put it in “{}”", place), summary)
+            (crate::localized_format!("已复制到「{}」", "Copied into “{}”", place), crate::settings::tr("原文件没有改动", "The originals are untouched").to_string())
         } else {
-            (crate::localized_format!("松手导入到「{}」", "Release to import into “{}”", place), summary)
+            // 导入 copies: say so where the drop lands, and that the originals stay as they are.
+            let _ = over;
+            (crate::localized_format!("松手即复制到「{}」", "Release to copy into “{}”", place), crate::localized_format!("{} · 原文件不变", "{} · originals untouched", summary))
         };
         let back = { let pose = pose.clone(); canvas(|_, _, _| {}, move |b, _, window, _| {
             back_plate(b.origin, &pose, window);
@@ -775,7 +807,7 @@ impl Workspace {
             .opacity(show * (0.08 + 0.92 * ((veil_p - 0.12) / 0.88).clamp(0., 1.)).min(show))
             .child(div().relative().flex_none().w(px(w * grow)).h(px(h * grow)).flex().items_center().justify_center()
                 .child(div().absolute().left(px(w * grow / 2. - 40.)).top(px(h * grow / 2. - 30.)).size(px(80.)).rounded_full()
-                    .shadow(vec![BoxShadow { color: if reject { ca(craft::N1000, 0.06) } else { accent.opacity(0.10 + 0.10 * lit + 0.06 * breath) }, offset: point(px(0.), px(0.)), blur_radius: px(90.), spread_radius: px(40. + 24. * lit) }]))
+                    .shadow(vec![BoxShadow { color: if reject { ca(craft::N1000, 0.06) } else { accent.opacity(0.10 + 0.10 * lit + 0.06 * breath) }, offset: point(px(0.), px(0.)), blur_radius: px(90.), spread_radius: px(40. + 24. * lit), inset: false }]))
                 .child(art))
             .child(div().mt(px(14.)).text_size(px(18.)).line_height(px(26.)).font_weight(FontWeight::SEMIBOLD)
                 .text_color(if reject { Theme::text_caption() } else { Theme::text() }).child(ui_text(title)))
@@ -800,7 +832,7 @@ impl Workspace {
             let depth = (46. + 34. * lit + 30. * flare) * show;
             let a = if reject { 0.10 } else { (0.16 + 0.06 * breath + 0.16 * lit + 0.2 * flare) * show };
             let (l, t, rw, rh, big) = (f32::from(ring.left()), f32::from(ring.top()), f32::from(ring.size.width), f32::from(ring.size.height), 400.);
-            let glow = [BoxShadow { color: tint.opacity(a), offset: point(px(0.), px(0.)), blur_radius: px(depth), spread_radius: px(0.) }];
+            let glow = [BoxShadow { color: tint.opacity(a), offset: point(px(0.), px(0.)), blur_radius: px(depth), spread_radius: px(0.), inset: false }];
             // Masks are only rectangles, so the ring's squircle inside (see `ui::squircle_path`)
             // is cut in 1px rows through the corner bands (the dashed line covers the steps);
             // one rect between.
@@ -815,15 +847,15 @@ impl Workspace {
                 window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
                     // Each strip reaches a point inside, or GPUI culls a shadow wholly outside the clip.
                     for side in [rect(l - big, t - big, rw + 2. * big, big + 1.), rect(l - big, t + rh - 1., rw + 2. * big, big + 1.), rect(l - big, t, big + 1., rh), rect(l + rw - 1., t, big + 1., rh)] {
-                        window.paint_shadows(side, px(0.).into(), &glow);
+                        window.paint_drop_shadows(side, px(0.).into(), &glow);
                     }
                 });
             }
             // The halo under the pointer.
             if !reject && !landed {
                 let c = point(at.x.max(b.left()).min(b.right()), at.y.max(b.top()).min(b.bottom()));
-                window.paint_shadows(Bounds::centered_at(c, size(px(40.), px(40.))), px(20.).into(),
-                    &[BoxShadow { color: accent.opacity(0.12 * lit * show), offset: point(px(0.), px(0.)), blur_radius: px(120.), spread_radius: px(70.) }]);
+                window.paint_drop_shadows(Bounds::centered_at(c, size(px(40.), px(40.))), px(20.).into(),
+                    &[BoxShadow { color: accent.opacity(0.12 * lit * show), offset: point(px(0.), px(0.)), blur_radius: px(120.), spread_radius: px(70.), inset: false }]);
             }
             let ring_a = if reject { 0.22 } else { (0.40 + 0.12 * breath + 0.35 * lit + 0.2 * flare).min(1.) } * show;
             if let Some(p) = crate::ui::squircle_path(ring, r, 1., PathBuilder::stroke(px(2.)).dash_array(&[px(6.), px(5.)])) { window.paint_path(p, tint.opacity(ring_a)); }

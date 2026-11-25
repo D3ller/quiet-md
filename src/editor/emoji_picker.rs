@@ -9,7 +9,8 @@ use super::view::{Editor, Menu};
 use crate::input::TextFieldEvent;
 use crate::model::*;
 use crate::feishu_theme::{self as theme, Theme};
-use crate::editor_ui::{MENU_RADIUS, ROW_RADIUS, TipExt, icon};
+use crate::editor_ui::{ROW_RADIUS, TipExt, icon};
+use crate::design::{Button, ButtonSize, Field, Popover, color};
 use gpui::{prelude::FluentBuilder, *};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,7 +36,6 @@ const ROW_H: f32 = 36.;
 const CELL: f32 = 36.;
 /// Rows start 24px in from the popover edge (23 inside its border).
 const INSET: f32 = 23.;
-const THUMB_MIN: f32 = 96.;
 
 const NAV: [(&str, &str); 8] = [
     ("最近", "emoji-frequent"),
@@ -120,7 +120,7 @@ impl Editor {
         // Keys go to the search box (typing must not reach the block), but it
         // only looks focused once clicked or typed into.
         let fh = self.emoji_field.read(cx).focus_handle(cx);
-        window.focus(&fh);
+        window.focus(&fh, cx);
         cx.notify();
     }
 
@@ -259,11 +259,8 @@ impl Editor {
             let y = (next - off - TITLE_H).min(0.);
             title_el(s.title, TITLE_H).absolute().top(px(y)).left_0().bg(theme::ta(255, 255, 255, 0.8))
         });
-        let thumb = (content_h > SCROLL_H).then(|| {
-            let h = (SCROLL_H * SCROLL_H / content_h).max(THUMB_MIN);
-            let top = (SCROLL_H - h) * off / (content_h - SCROLL_H);
-            div().absolute().right_0().top(px(top)).w(px(7.)).h(px(h)).rounded(px(3.5)).group_hover("emoji-scroll", |s| s.bg(Theme::scrollbar_thumb()))
-        });
+        // the shared scrollbar (shadcn's ScrollArea), square-edged: the area sits inside the picker's padding
+        let thumb = self.emoji_bar.render(&self.emoji_scroll);
         let scroll = div()
             .id("emoji-scroll-area")
             .group("emoji-scroll")
@@ -274,41 +271,27 @@ impl Editor {
             .overflow_hidden()
             .child(div().id("emoji-scroll").size_full().overflow_y_scroll().track_scroll(&self.emoji_scroll).child(content))
             .children(sticky)
-            .children(thumb);
+            .child(thumb);
 
         let field_on = self.emoji_search_active && self.emoji_field.read(cx).is_focused(window);
         let has_text = !self.emoji_field.read(cx).text.is_empty();
-        // The search box: radius 9, white, hairline; the accent once active.
-        let search = div()
-            .id("emoji-search")
+        // The search box: a field, focused once active.
+        let search = Field::new("emoji-search")
+            .focused(field_on)
             .relative()
             .w(px(363.))
-            .h(px(36.))
-            .rounded(px(9.))
-            .bg(crate::theme::raised(Theme::bg_body()))
-            .border_1()
-            .border_color(if field_on { Theme::primary() } else { Theme::line_border() })
             .pl(px(39.))
             .pr(px(43.))
-            .flex()
-            .items_center()
-            .child(div().absolute().left(px(11.)).top(px(9.5)).child(icon("search", 15., Theme::icon())))
+            .child(div().absolute().left(px(11.)).top(px(9.)).child(icon("search", 16., color::muted_foreground())))
             .child(div().flex_1().min_w_0().child(self.emoji_field.clone()))
             .when(has_text, |d| {
                 d.child(
-                    div()
-                        .id("emoji-search-clear")
+                    Button::ghost("emoji-search-clear")
+                        .sized(ButtonSize::Xs)
+                        .icon("x")
                         .absolute()
                         .right(px(5.))
                         .top(px(5.))
-                        .size(px(24.))
-                        .rounded(px(ROW_RADIUS))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(Theme::fill_hover()))
-                        .child(icon("x", 14., Theme::icon()))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|ed, _, window, cx| {
@@ -319,7 +302,7 @@ impl Editor {
                                     *selected = 0;
                                 }
                                 let fh = ed.emoji_field.read(cx).focus_handle(cx);
-                                window.focus(&fh);
+                                window.focus(&fh, cx);
                                 cx.notify();
                             }),
                         ),
@@ -332,23 +315,10 @@ impl Editor {
                     cx.notify();
                 }),
             );
-        // 随机: a white button (hairline, 1px drop, radius 9).
-        let random = div()
-            .id("emoji-random")
-            .size(px(36.))
-            .rounded(px(9.))
-            .bg(crate::theme::raised(Theme::bg_body()))
-            .border_1()
-            .border_color(Theme::button_border())
-            .shadow(theme::shadow_button())
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .hover(|s| s.bg(Theme::fill_hover()))
-            .active(|s| s.bg(Theme::fill_pressed()))
+        // 随机: an outline icon button.
+        let random = Button::outline("emoji-random")
             .tip_above(crate::settings::text("随机"), None)
-            .child(icon("shuffle", 18., Theme::icon()))
+            .child(icon("shuffle", 16., color::muted_foreground()))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |ed, _, window, cx| ed.pick_emoji(target, emoji::random_pick(), false, window, cx)));
 
@@ -359,22 +329,16 @@ impl Editor {
                 .left_0()
                 .right_0()
                 .h(px(2.))
-                .bg(linear_gradient(180., linear_color_stop(theme::rgbaf(0, 0, 0, 0.05), 0.), linear_color_stop(theme::rgbaf(0, 0, 0, 0.), 1.))),
+                .bg(linear_gradient(180., linear_color_stop(theme::rgbaf(0, 0, 0, if crate::theme::dark() { 0.35 } else { 0.05 }), 0.), linear_color_stop(theme::rgbaf(0, 0, 0, 0.), 1.))),
         );
         for (i, (label, ic)) in NAV.iter().enumerate() {
             let on = !searching && i == current;
             nav = nav.child(
-                div()
-                    .id(("emoji-nav", i))
+                Button::ghost(("emoji-nav", i))
                     .size(px(30.))
-                    .rounded(px(ROW_RADIUS))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(Theme::fill_hover()))
+                    .selected(on)
                     .tip_above(label, None)
-                    .child(icon(ic, 18., if on { Theme::primary() } else { Theme::icon() }))
+                    .child(icon(ic, 16., if on { color::foreground() } else { color::muted_foreground() }))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |ed, _, _, cx| {
                         // A category click leaves search.
@@ -386,42 +350,27 @@ impl Editor {
             );
         }
 
-        let el = div()
-            .id("emoji-picker")
-            .occlude()
+        let el = Popover::new("emoji-picker")
             .relative()
             .w(px(W))
             .h(px(h))
             .flex()
             .flex_col()
-            .bg(crate::theme::raised(Theme::bg_body()))
-            .border_1()
-            .border_color(Theme::line_border())
-            .rounded(px(MENU_RADIUS))
-            .shadow(theme::shadow_s4_down())
-            .font_family(theme::UI_FONT)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+            .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
             .when(tabs, |d| {
                 d.child(
                     div().flex_none().h(px(TABS_H)).pl(px(24.)).flex().child(
-                        div().pt(px(20.)).pb(px(12.)).text_size(px(13.)).line_height(px(22.)).font_weight(FontWeight::SEMIBOLD).text_color(Theme::primary()).child(crate::settings::text("表情符号")),
+                        div().pt(px(20.)).pb(px(12.)).text_size(px(13.)).line_height(px(22.)).font_weight(FontWeight::SEMIBOLD).text_color(crate::design::color::foreground()).child(crate::settings::text("表情符号")),
                     ),
                 )
                 .child(
-                    div()
-                        .id("emoji-remove")
+                    Button::ghost("emoji-remove")
                         .absolute()
-                        .top(px(18.))
+                        .top(px(15.))
                         .right(px(21.))
-                        .px(px(6.))
-                        .rounded(px(ROW_RADIUS))
-                        .text_size(px(13.))
-                        .line_height(px(22.))
-                        .text_color(Theme::text_caption())
-                        .cursor_pointer()
-                        .hover(|s| s.bg(Theme::fill_hover()).text_color(Theme::text()))
-                        .child(crate::settings::text("移除"))
+                        .text_color(color::muted_foreground())
+                        .label(crate::settings::text("移除"))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(|ed, _, window, cx| {
                             ed.close_menu_focus(window, cx);
@@ -443,7 +392,7 @@ impl Editor {
         let (x, y) = if over_below <= over_right { (l, b + OFFSET) } else { (r + OFFSET, t) };
         let x = x.min(vw - BOUNDARY - W).max(BOUNDARY);
         let y = y.min(vh - BOUNDARY - h).max(BOUNDARY);
-        Some(at(self.rel(point(px(x), px(y))), Corner::TopLeft, el))
+        Some(at(self.rel(point(px(x), px(y))), Anchor::TopLeft, el))
     }
 }
 

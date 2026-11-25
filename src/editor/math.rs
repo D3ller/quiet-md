@@ -101,7 +101,7 @@ impl Math {
             match it {
                 Item::Text { x, y, line } => {
                     let lh = line.ascent + line.descent;
-                    let _ = line.paint(point(origin.x + px(*x), origin.y + px(*y) - line.ascent), lh, window, cx);
+                    let _ = line.paint(point(origin.x + px(*x), origin.y + px(*y) - line.ascent), lh, TextAlign::Left, None, window, cx);
                 }
                 Item::Rect { x, y, w, h, color } => {
                     window.paint_quad(fill(
@@ -111,7 +111,7 @@ impl Math {
                 }
                 Item::Svg { x, y, w, h, path, color } => {
                     let b = Bounds::new(point(origin.x + px(*x), origin.y + px(*y)), size(px(*w), px(*h)));
-                    let _ = window.paint_svg(b, path.clone(), TransformationMatrix::unit(), *color, cx);
+                    let _ = window.paint_svg(b, path.clone(), None, TransformationMatrix::unit(), *color, cx);
                 }
             }
         }
@@ -460,8 +460,10 @@ fn css_color(v: &str) -> Option<Hsla> {
     Some(rgb_u32(rgb))
 }
 
+/// A colour the formula names (`\color{navy}`), written for a light page: in the dark it is
+/// mirrored like the page's own colours and lifted until it reads (black would vanish otherwise).
 fn rgb_u32(n: u32) -> Hsla {
-    rgb(n).into()
+    crate::theme::lift(crate::theme::adapt(rgb(n).into()), 4.5)
 }
 
 struct Engine<'a> {

@@ -11,7 +11,7 @@ use crate::model::InlineReminder;
 use crate::settings::{Lang, localized, translate};
 use crate::input::{TextField, TextFieldEvent};
 use crate::editor_theme::{Theme, c, craft};
-use crate::editor_ui::{ROW_RADIUS, icon, panel, popover};
+use crate::design::{Button, ButtonSize, Checkbox, Field, FieldSize, MenuItem, Popover, menu as dmenu};
 use gpui::{prelude::FluentBuilder, *};
 use std::{cell::Cell, rc::Rc, time::Duration};
 
@@ -47,12 +47,12 @@ const EVENING: (&str, i64) = ("当天 (18:00)", 18 * HOUR - DAY_END);
 const POPOVER_W: f32 = 314.;
 const CARD_W: f32 = 280.;
 const SELECT_W: f32 = 174.;
-/// Row pitch (26pt list rows, no gaps), the list's 5 + 5 padding, its height.
-const ITEM_H: f32 = crate::editor_ui::MENU_ROW_H;
-const LIST_PAD: f32 = 2. * crate::editor_ui::MENU_PAD_Y;
+/// Row pitch (menu rows, no gaps), the list's padding, its height.
+const ITEM_H: f32 = dmenu::ROW_H;
+const LIST_PAD: f32 = 2. * dmenu::PAD;
 const LIST_H: f32 = 240.;
-/// The selects: 30pt inputs.
-const SELECT_H: f32 = 30.;
+/// The selects: small fields.
+const SELECT_H: f32 = crate::design::G.field_sm_h;
 const SHOW_DELAY: Duration = Duration::from_millis(600);
 
 fn off() -> i64 {
@@ -325,24 +325,6 @@ fn track(cell: &Rc<Cell<Option<Bounds<Pixels>>>>) -> impl IntoElement {
     canvas(move |b, _, _| cell.set(Some(b)), |_, _, _, _| {}).absolute().inset_0()
 }
 
-/// The check box: rounded, a hairline rim open, accent with a white check on.
-fn checkbox(on: bool) -> Div {
-    div()
-        .size(px(16.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(4.))
-        .when(on, |d| d.bg(Theme::primary()).child(icon("check", 12., gpui::white())))
-        .when(!on, |d| d.border_1().border_color(Theme::todo_box()).bg(crate::theme::raised(gpui::white())))
-}
-
-/// `.reminder-popover-wrapper` box: the second-level panel (white,
-/// hairline, radius 12, the panel drop).
-fn shell() -> Div {
-    panel()
-}
 
 impl Editor {
     pub(super) fn reminder_open(&self) -> bool {
@@ -368,6 +350,8 @@ impl Editor {
     }
 
     pub(super) fn insert_new_reminder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A Markdown file can't keep a reminder (⌘⌥W included).
+        if self.markdown { return; }
         if let Some(p) = self.core.insert_reminder(&default_reminder(now())) {
             self.changed(window, cx);
             self.open_reminder(p, cx);
@@ -384,7 +368,7 @@ impl Editor {
         if matches!(self.menu, Some(Menu::Reminder { .. })) {
             self.menu = None;
         }
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -430,7 +414,7 @@ impl Editor {
                 if let Some(p) = &mut self.rm.panel {
                     p.drop = None;
                 }
-                window.focus(&self.focus);
+                window.focus(&self.focus, cx);
             }
             TextFieldEvent::Cancel => {
                 if self.rm.panel.as_ref().is_some_and(|p| p.drop.is_some()) {
@@ -469,7 +453,7 @@ impl Editor {
         let at_ = p.at;
         if d == Drop::Time {
             let fh = self.rm.time.read(cx).focus_handle(cx);
-            window.focus(&fh);
+            window.focus(&fh, cx);
             self.rm.time.update(cx, |f, cx| f.select_all_text(cx));
             if let Some(r) = self.core.reminder_at(at_) {
                 let t = r.expire - day_start(r.expire);
@@ -480,7 +464,7 @@ impl Editor {
                 self.rm.list.set_offset(point(px(0.), px(-y)));
             }
         } else {
-            window.focus(&self.focus);
+            window.focus(&self.focus, cx);
         }
         cx.notify();
     }
@@ -502,12 +486,12 @@ impl Editor {
             }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
-                popover().w(px(CARD_W)).child(
+                Popover::new("rm-card-box").w(px(CARD_W)).child(
                     div().mx(px(16.)).h(px(40.)).flex().items_center().justify_center().text_size(px(13.)).line_height(px(20.)).child(reminder_label(r, crate::settings::tr("，", ", "))),
                 ),
             );
         let x = rect.center().x - px(CARD_W / 2.);
-        Some(if up { at(self.rel(point(x, rect.top())), Corner::BottomLeft, el) } else { at(self.rel(point(x, rect.bottom())), Corner::TopLeft, el) })
+        Some(if up { at(self.rel(point(x, rect.top())), Anchor::BottomLeft, el) } else { at(self.rel(point(x, rect.bottom())), Anchor::TopLeft, el) })
     }
 
     /// The editor (`intact` popover): calendar, 设置时间, 提醒.
@@ -524,16 +508,9 @@ impl Editor {
         let today = day_of(now);
         let picked = day_of(r.expire);
         let nav = |key: &'static str, name: &'static str, delta: i64| {
-            div()
-                .id(key)
-                .size(px(24.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(ROW_RADIUS))
-                .cursor_pointer()
-                .hover(|s| s.bg(Theme::fill_hover_strong()))
-                .child(icon(name, 16., Theme::icon()))
+            Button::ghost(key)
+                .sized(ButtonSize::Xs)
+                .icon(name)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |e, _, _, cx| {
@@ -609,33 +586,16 @@ impl Editor {
         // 设置时间 / 提醒
         let timed = !r.whole_day;
         let check_row = |key: &'static str, on: bool, label: &'static str| {
-            div().id(key).h(px(22.)).mb(px(8.)).flex().items_center().cursor_pointer().child(checkbox(on).mr(px(8.))).child(div().line_height(px(22.)).child(label))
+            div().id(key).h(px(22.)).mb(px(8.)).flex().items_center().cursor_pointer().child(Checkbox::new(on).mr(px(8.))).child(div().line_height(px(22.)).child(label))
         };
         let open = p.drop;
-        // The input: 30 tall, radius 9, white, hairline; the accent while open.
-        let select = |ix: usize, active: bool| {
-            div()
-                .relative()
-                .w(px(SELECT_W))
-                .h(px(SELECT_H))
-                .pl(px(10.))
-                .pr(px(8.))
-                .flex()
-                .items_center()
-                .rounded(px(9.))
-                .border_1()
-                .border_color(if active { Theme::primary() } else { Theme::line_border() })
-                .bg(crate::theme::raised(Theme::bg_body()))
-                .cursor_pointer()
-                .when(!active, |d| d.hover(|s| s.border_color(crate::editor_theme::ca(craft::N1000, 0.16))))
-                .child(track(&self.rm.selects[ix]))
+        // The selects: small select fields, focused while open.
+        let select = |id: &'static str, ix: usize, active: bool| {
+            Field::select(id).sized(FieldSize::Sm).open(active).relative().w(px(SELECT_W)).child(track(&self.rm.selects[ix]))
         };
-        let chevron = || div().ml(px(8.)).flex_none().child(icon("chevron-down", 12., Theme::icon()));
         let time_focused = self.rm.time.read(cx).is_focused(window);
-        let time_select = select(0, open == Some(Drop::Time) || time_focused)
-            .id("rm-time")
+        let time_select = select("rm-time", 0, open == Some(Drop::Time) || time_focused)
             .child(div().flex_1().min_w_0().child(self.rm.time.clone()))
-            .child(chevron())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|e, _, window, cx| {
@@ -644,10 +604,8 @@ impl Editor {
                 }),
             );
         let jet = r.notify - r.expire;
-        let jet_select = select(1, open == Some(Drop::Jet))
-            .id("rm-jet")
-            .child(div().flex_1().min_w_0().overflow_hidden().text_size(px(13.)).line_height(px(20.)).child(jet_label(r.whole_day, jet)))
-            .child(chevron())
+        let jet_select = select("rm-jet", 1, open == Some(Drop::Jet))
+            .child(div().flex_1().min_w_0().overflow_hidden().child(jet_label(r.whole_day, jet)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|e, _, window, cx| {
@@ -717,7 +675,7 @@ impl Editor {
                     e.close_reminder(window, cx);
                 }
             }))
-            .child(shell().w(px(POPOVER_W)).child(calendar).child(options));
+            .child(Popover::new("rm-panel").w(px(POPOVER_W)).child(calendar).child(options));
         let h = 5. + 12. + 32. + 32. + 248. + 1. + 20. + 30. + 16. + 30. + 24. + 10. + if timed { SELECT_H } else { 0. } + if notify { SELECT_H } else { 0. };
         let vh = f32::from(window.viewport_size().height);
         let view_top = f32::from(self.list.viewport_bounds().top());
@@ -725,7 +683,7 @@ impl Editor {
         let above = f32::from(rect.top()) - view_top;
         let up = below < h && above > below;
         let x = rect.center().x - px(POPOVER_W / 2.);
-        Some(if up { at(self.rel(point(x, rect.top())), Corner::BottomLeft, el) } else { at(self.rel(point(x, rect.bottom())), Corner::TopLeft, el) })
+        Some(if up { at(self.rel(point(x, rect.top())), Anchor::BottomLeft, el) } else { at(self.rel(point(x, rect.bottom())), Anchor::TopLeft, el) })
     }
 
     /// The open select's list.
@@ -742,25 +700,12 @@ impl Editor {
         };
         let mut col = div().id(("rm-list", ix)).max_h(px(LIST_H)).py(px(LIST_PAD / 2.)).overflow_y_scroll().when(d == Drop::Time, |d| d.track_scroll(&self.rm.list));
         let n = items.len();
-        // List rows: 32 tall, 13pt, grey hover; the current choice
-        // in the accent on its tint.
+        // List rows: menu rows, the current choice checked.
         for (i, (label, v, on)) in items.into_iter().enumerate() {
             col = col.child(
-                div()
-                    .id(("rm-opt", i))
-                    .flex_none()
-                    .mx(px(5.))
-                    .h(px(ITEM_H))
-                    .px(px(8.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(ROW_RADIUS))
-                    .line_height(px(20.))
-                    .text_size(px(13.))
-                    .cursor_pointer()
-                    .when(on, |s| s.bg(Theme::fill_turninto_active()).text_color(Theme::primary()))
-                    .when(!on, |s| s.hover(|s| s.bg(Theme::fill_hover())))
-                    .child(label)
+                MenuItem::new(("rm-opt", i))
+                    .label(label)
+                    .checked(on)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |e, _, window, cx| {
@@ -772,17 +717,17 @@ impl Editor {
                                 Drop::Time => e.apply_reminder(|r| at_time(r, v), window, cx),
                                 Drop::Jet => e.apply_reminder(|r| with_jet(r, v), window, cx),
                             }
-                            window.focus(&e.focus);
+                            window.focus(&e.focus, cx);
                         }),
                     ),
             );
         }
         let w = f32::from(a.size.width).max(166.);
-        let h = (n as f32 * ITEM_H + LIST_PAD).min(LIST_H) + 2.;
+        let h = (n as f32 * ITEM_H + LIST_PAD).min(LIST_H);
         let vh = f32::from(window.viewport_size().height);
         let below = f32::from(a.bottom()) + 4.;
         let y = if below + h > vh - 8. { f32::from(a.top()) - 4. - h } else { below };
-        let list = super::countdown::list_box().w(px(w)).occlude().child(col).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let list = super::countdown::list_box(("rm-list-box", ix)).w(px(w)).child(col).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         vec![deferred(anchored().position_mode(AnchoredPositionMode::Window).position(point(a.left(), px(y))).child(list)).with_priority(3).into_any_element()]
     }
 }
@@ -865,6 +810,26 @@ mod tests {
         assert_eq!(time_string_for(t(2026, 10, 27, 9, 0), false, now, Lang::Ar), "الثلاثاء القادم");
         assert_eq!(time_string_for(t(2026, 11, 3, 9, 0), false, now, Lang::Ar), "3/11");
         assert_eq!(time_string_for(t(2027, 1, 3, 9, 0), true, now, Lang::Ar), "3/1/2027 09:00");
+    }
+
+    #[test]
+    fn traditional_chinese_chip_text() {
+        let now = t(2026, 10, 22, 10, 0);
+        assert_eq!(time_string_for(t(2026, 10, 23, 0, 0), false, now, Lang::ZhTw), "明天");
+        assert_eq!(time_string_for(t(2026, 10, 25, 9, 0), false, now, Lang::ZhTw), "本週日");
+        assert_eq!(time_string_for(t(2026, 10, 27, 9, 0), false, now, Lang::ZhTw), "下週二");
+        assert_eq!(time_string_for(t(2026, 11, 3, 9, 0), false, now, Lang::ZhTw), "11月3日");
+        assert_eq!(time_string_for(t(2027, 1, 3, 9, 0), true, now, Lang::ZhTw), "2027年1月3日 09:00");
+    }
+
+    #[test]
+    fn turkish_chip_text() {
+        let now = t(2026, 10, 22, 10, 0);
+        assert_eq!(time_string_for(t(2026, 10, 23, 0, 0), false, now, Lang::Tr), "Yarın");
+        assert_eq!(time_string_for(t(2026, 10, 25, 9, 0), false, now, Lang::Tr), "Bu Pazar");
+        assert_eq!(time_string_for(t(2026, 10, 27, 9, 0), false, now, Lang::Tr), "Gelecek Salı");
+        assert_eq!(time_string_for(t(2026, 11, 3, 9, 0), false, now, Lang::Tr), "3.11");
+        assert_eq!(time_string_for(t(2027, 1, 3, 9, 0), true, now, Lang::Tr), "3.1.2027 09:00");
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Dropping onto the sidebar's 我的文档: files from the Finder are imported
-//! into the folder under the pointer (a document row: its folder; elsewhere:
-//! the top), and a 本机文件 row carried up into the tree is imported there.
+//! into the folder under the pointer, or between the rows there (a document
+//! row only opens a slot beside it, #418), and a 本机文件 row carried up into
+//! the tree is imported there.
+use fdl_core::vfs::PathExt as _;
 use crate::app::Workspace;
 use crate::settings::tr;
 use crate::theme::{self, Theme};
@@ -10,13 +12,13 @@ use std::path::PathBuf;
 
 /// A 本机文件 row being carried: GPUI's drag payload, drawn as the row lifted.
 #[derive(Clone)]
-pub(crate) struct LocalRowDrag { pub id: String, pub title: String }
+pub(crate) struct LocalRowDrag { pub id: String, pub title: String, pub folder: bool }
 
 impl Render for LocalRowDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div().h(px(crate::sidebar::ROW_H)).w(px(220.)).pl(px(6.)).pr(px(10.)).flex().items_center().rounded(px(crate::sidebar::ROW_R))
             .bg(theme::raised(Theme::bg_body())).shadow(theme::shadow_menu()).opacity(0.96)
-            .child(div().size(px(20.)).flex_none().flex().items_center().justify_center().child(icon("doc-md", crate::sidebar::ROW_ICON, Theme::icon())))
+            .child(div().size(px(20.)).flex_none().flex().items_center().justify_center().child(icon(if self.folder { "folder" } else { "doc-md" }, crate::sidebar::ROW_ICON, Theme::icon())))
             .child(div().pl(px(9.)).flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(13.)).text_color(Theme::text())
                 .child(ui_text(self.title.clone())))
     }
@@ -34,7 +36,7 @@ impl SidebarDropAt {
 }
 
 fn importable(p: &std::path::Path) -> bool {
-    p.is_dir() || crate::local_files::is_markdown_path(p) || p.extension().is_some_and(|x| x.eq_ignore_ascii_case("xml"))
+    p.fs_is_dir() || crate::local_files::is_markdown_path(p) || p.extension().is_some_and(|x| x.eq_ignore_ascii_case("xml")) || crate::transfer::is_csv_path(p)
 }
 
 impl Workspace {
@@ -56,7 +58,7 @@ impl Workspace {
     /// Files from the Finder let go over the sidebar.
     pub(crate) fn sidebar_files_dropped(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let Some(target) = self.sidebar_drop.take() else { return };
-        let (dirs, files): (Vec<_>, Vec<_>) = paths.into_iter().filter(|p| importable(p)).partition(|p| p.is_dir());
+        let (dirs, files): (Vec<_>, Vec<_>) = paths.into_iter().filter(|p| importable(p)).partition(|p| p.fs_is_dir());
         if dirs.is_empty() && files.is_empty() {
             self.show_toast_kind(crate::ui::ToastKind::Error, tr("这些文件不能导入：支持 Markdown、DocxXML 文件和文件夹", "These files can't be imported: Markdown, DocxXML files and folders are supported"), cx);
             cx.notify();
@@ -75,19 +77,19 @@ impl Workspace {
     /// The place a drop goes, for the dialog and the toast.
     pub(crate) fn drop_place(&self, target: &SidebarDropAt) -> String {
         target.parent.as_ref().and_then(|t| self.entries.iter().find(|e| &e.id == t)).map(|e| crate::settings::display_title(&e.title))
-            .unwrap_or_else(|| tr("我的文档", "My documents").to_string())
+            .unwrap_or_else(|| self.home_name())
     }
 
     /// 导入 confirmed: bring it in where it was dropped.
     pub(crate) fn import_dropped(&mut self, what: crate::app::DropImport, target: SidebarDropAt, window: &mut Window, cx: &mut Context<Self>) {
         match what {
             crate::app::DropImport::Files(paths) => self.import_dropped_files(paths, target, window, cx),
-            crate::app::DropImport::Local(id) => self.import_dropped_local(&id, target, cx),
+            crate::app::DropImport::Local(id) => self.import_dropped_local(&id, target, window, cx),
         }
     }
 
     fn import_dropped_files(&mut self, paths: Vec<PathBuf>, target: SidebarDropAt, window: &mut Window, cx: &mut Context<Self>) {
-        let (dirs, files): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| p.is_dir());
+        let (dirs, files): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| p.fs_is_dir());
         let known: std::collections::HashSet<String> = self.entries.iter().map(|e| e.id.clone()).collect();
         let parent = target.parent.clone();
         self.landed_in(parent.as_deref());
@@ -110,11 +112,20 @@ impl Workspace {
         self.ask_import(crate::app::DropImport::Local(id.to_string()), target, cx);
     }
 
-    fn import_dropped_local(&mut self, id: &str, target: SidebarDropAt, cx: &mut Context<Self>) {
+    fn import_dropped_local(&mut self, id: &str, target: SidebarDropAt, window: &mut Window, cx: &mut Context<Self>) {
+        // A folder under 本机文件: copied in like any folder.
+        if self.entries.iter().any(|e| e.id == id && e.meta.folder.is_some()) {
+            let Some(dir) = self.store.local_path(id) else { return };
+            self.landed_in(target.parent.as_deref());
+            let parent = target.parent.clone();
+            self.import_folder_then(&dir, parent, false, Some(Box::new(move |w, id| w.place_dropped(&[id.to_string()], &target))), window, cx);
+            return;
+        }
         let Some(doc) = self.doc_of(id, cx) else { return };
         let front = self.store.front_matter_of(id);
-        match self.store.with(|s| s.create_markdown_in(&doc, &front, target.parent.as_deref())) {
+        match self.store.create_markdown_in(&doc, &front, target.parent.as_deref()) {
             Ok(new) => {
+                if let Some(src) = self.store.local_path(id) { self.keep_times(&new, &src); }
                 self.place_dropped(&[new], &target);
                 self.landed_in(target.parent.as_deref());
                 let place = self.drop_place(&target);
@@ -129,9 +140,9 @@ impl Workspace {
     fn place_dropped(&mut self, ids: &[String], target: &SidebarDropAt) {
         let journal = self.store.track_file_changes();
         if target.slot.is_some() {
-            for id in ids { let _ = self.store.with(|s| s.move_in_tree(id, target.parent.as_deref(), target.before.as_deref())); }
+            for id in ids { let _ = self.store.move_in_tree(id, target.parent.as_deref(), target.before.as_deref()); }
         }
-        self.entries = self.store.list();
+        self.entries.set(self.store.list());
         self.sort();
         // Part of the import: undo checks every place it recorded.
         self.amend_file_record(ids, journal.take());
@@ -140,7 +151,6 @@ impl Workspace {
     /// The folder that took a drop opens and bounces.
     fn landed_in(&mut self, folder: Option<&str>) {
         if let Some(f) = folder { self.expanded.insert(f.to_string()); self.folder_drag.kick(f, 4.5); }
-        self.folded[1] = false;
     }
 
     /// Nothing is being dragged any more: forget the drop target.

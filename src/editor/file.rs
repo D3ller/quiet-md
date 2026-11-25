@@ -2,6 +2,7 @@
 //! (the first page or frame from Quick Look's thumbnailer, the inline audio
 //! player), its toolbar, and inserting picked or dropped files.
 
+use fdl_core::vfs::{PathExt as _, KindExt as _};
 use super::core::{DropPlace, Pos, Selection, TITLE};
 use super::overlays::{Probe, at};
 use super::render::{Env, R};
@@ -10,7 +11,9 @@ use crate::store::image_path;
 use crate::model::*;
 use crate::store::Store;
 use crate::editor_theme::{self as theme, Theme, craft};
-use crate::editor_ui::{ROW_RADIUS, TipExt, icon, popover};
+use crate::editor_ui::{ROW_RADIUS, TipExt, icon};
+use crate::design::toolbar::{TOOLBAR_H, toolbar_layout, w as tw};
+use crate::design::{Button, ButtonGroupSeparator, ButtonSize, Toggle, Toolbar};
 use super::image::picture;
 use gpui::{prelude::FluentBuilder, *};
 use std::cell::RefCell;
@@ -128,7 +131,7 @@ pub fn type_icon(k: Kind, s: f32) -> Div {
 /// The same icon painted into `b` (the inline chip).
 pub fn paint_type_icon(k: Kind, b: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
     for (path, color) in [("editor-icons/file-page.svg", theme::c(kind_color(k))), ("editor-icons/file-fold.svg", theme::rgbaf(255, 255, 255, 0.45)), (glyph(k), gpui::white())] {
-        let _ = window.paint_svg(b, path.into(), TransformationMatrix::unit(), color, cx);
+        let _ = window.paint_svg(b, path.into(), None, TransformationMatrix::unit(), color, cx);
     }
 }
 
@@ -196,7 +199,7 @@ impl FileUi {
         if let Some(s) = self.sizes.borrow().get(p) {
             return *s;
         }
-        let s = std::fs::metadata(p).ok().filter(|m| m.is_file()).map(|m| m.len());
+        let s = fdl_core::vfs::metadata(p).ok().filter(|m| m.fs_is_file()).map(|m| m.len());
         self.sizes.borrow_mut().insert(p.to_path_buf(), s);
         s
     }
@@ -240,7 +243,7 @@ impl FileUi {
 fn thumb_dir(p: &Path) -> PathBuf {
     let mut h = rustc_hash::FxHasher::default();
     p.hash(&mut h);
-    if let Ok(m) = std::fs::metadata(p) {
+    if let Ok(m) = fdl_core::vfs::metadata(p) {
         m.len().hash(&mut h);
         m.modified().ok().hash(&mut h);
     }
@@ -248,12 +251,12 @@ fn thumb_dir(p: &Path) -> PathBuf {
 }
 
 fn first_png(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "png"))
+    fdl_core::vfs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "png"))
 }
 
 fn make_thumb(p: &Path) -> Option<PathBuf> {
     let dir = thumb_dir(p);
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = fdl_core::vfs::create_dir_all(&dir);
     let _ = std::process::Command::new("qlmanage")
         .args(["-t", "-s", "1200", "-o"])
         .arg(&dir)
@@ -267,7 +270,7 @@ fn make_thumb(p: &Path) -> Option<PathBuf> {
 
 /// Opens the file in Quick Look (scripted runs only log it).
 pub fn quick_look(p: &Path) {
-    if crate::devtools::scripted() {
+    if crate::devtools::scripted() || cfg!(target_family = "wasm") {
         eprintln!("quicklook {}", p.display());
         return;
     }
@@ -281,11 +284,11 @@ pub fn quick_look(p: &Path) {
 /// A new attachment for `p`, copied into `assets/files/<uuid>/<name>`.
 fn file_block_from_path(p: &Path) -> Option<Block> {
     let name = p.file_name()?.to_string_lossy().to_string();
-    let size = std::fs::metadata(p).ok().filter(|m| m.is_file())?.len();
+    let size = fdl_core::vfs::metadata(p).ok().filter(|m| m.fs_is_file())?.len();
     let dir = Store::assets_dir().join("files").join(uuid::Uuid::new_v4().to_string());
-    std::fs::create_dir_all(&dir).ok()?;
+    fdl_core::vfs::create_dir_all(&dir).ok()?;
     let dest = dir.join(&name);
-    std::fs::copy(p, &dest).ok()?;
+    fdl_core::vfs::copy(p, &dest).ok()?;
     let view = match preview_of(&name) {
         Some(Kind::Audio) => FileView::Preview,
         Some(Kind::Video) if size < VIDEO_PREVIEW_MAX => FileView::Preview,
@@ -296,15 +299,20 @@ fn file_block_from_path(p: &Path) -> Option<Block> {
     Some(Block::new(BlockKind::File(f), RichText::default()))
 }
 
-/// Opens the attachment right away (the card's 预览, the video's play).
+/// Previews the attachment right away (the card's 预览, the video's play).
 fn open_listener(p: Option<PathBuf>, cx: &mut Context<Editor>) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
     cx.listener(move |e: &mut Editor, _: &MouseDownEvent, window, cx| {
         cx.stop_propagation();
         window.prevent_default();
-        e.open_file(p.as_deref(), cx);
+        e.preview_file(p.as_deref(), cx);
     })
 }
 
+/// A floating toolbar's icon button.
+/// A toolbar action (design::toolbar): a ghost `icon-sm` button.
+fn tool_btn(id: impl Into<ElementId>) -> Button { Button::ghost(id).sized(ButtonSize::Sm) }
+
+/// The audio player's buttons (in the page).
 fn shell_btn(id: impl Into<ElementId>) -> Stateful<Div> {
     div()
         .id(id)
@@ -352,11 +360,14 @@ impl R<'_> {
                 .absolute()
                 .inset_0()
         });
-        // A click on the selected attachment (any click when reading) opens it.
+        // A click on the selected attachment (any click when reading) opens it;
+        // so does a double click on a file that opens in a window of its own
+        // (the first click selected it; asked twice, that window only comes forward).
         let open_on_click = {
             let p = path.clone();
+            let own = p.as_deref().is_some_and(crate::local_files::opens_here);
             cx.listener(move |e: &mut Editor, ev: &MouseDownEvent, window, cx| {
-                if ev.click_count == 1 && !ev.modifiers.shift && (e.read_only || e.active_file(e.focus.is_focused(window)) == Some(id)) {
+                if (ev.click_count == 1 || own && ev.click_count == 2) && !ev.modifiers.shift && (e.read_only || e.active_file(e.focus.is_focused(window)) == Some(id)) {
                     cx.stop_propagation();
                     window.prevent_default();
                     e.open_file(p.as_deref(), cx);
@@ -607,7 +618,7 @@ impl R<'_> {
         div()
             .w_full()
             .flex()
-            .font_family(theme::UI_FONT)
+            .font_family(theme::DOC_UI_FONT)
             .map(|d| match b.align {
                 Align::Left => d.justify_start(),
                 Align::Center => d.justify_center(),
@@ -630,16 +641,36 @@ impl Editor {
         .then_some(h)
     }
 
+    /// 打开: a file Quiet.md edits (`local_files::opens_here`) in a window of
+    /// its own, where it is; any other as `preview_file`.
     pub(super) fn open_file(&mut self, p: Option<&Path>, cx: &mut Context<Self>) {
-        match p.filter(|p| p.is_file()) {
+        match p.filter(|p| p.fs_is_file()) {
+            Some(p) if crate::local_files::opens_here(p) => cx.emit(super::view::EditorEvent::OpenFile(p.to_path_buf())),
+            _ => self.preview_file(p, cx),
+        }
+    }
+
+    /// 预览 (the eye, 全屏, a video's play): Quick Look, whatever the file is.
+    pub(super) fn preview_file(&mut self, p: Option<&Path>, cx: &mut Context<Self>) {
+        match p.filter(|p| p.fs_is_file()) {
             Some(p) => quick_look(p),
             None => self.toast(crate::settings::text("文件不存在"), cx),
         }
     }
 
+    /// Attachments changed on disk (one was edited in its own window, the
+    /// window came forward): sizes and previews are read again.
+    pub(crate) fn files_changed(&mut self, cx: &mut Context<Self>) {
+        self.file.sizes.borrow_mut().clear();
+        // One still being made stays queued; a preview is kept by the file's size and time (`thumb_dir`).
+        self.file.thumbs.borrow_mut().retain(|_, t| *t == Thumb::Pending);
+        self.img.generation += 1;
+        cx.notify();
+    }
+
     /// 下载: a copy where the save panel says (Downloads first).
     pub(super) fn download_file(&mut self, f: &FileBlock, cx: &mut Context<Self>) {
-        let Some(src) = local_path(f).filter(|p| p.is_file()) else { return self.toast(crate::settings::text("文件不存在"), cx) };
+        let Some(src) = local_path(f).filter(|p| p.fs_is_file()) else { return self.toast(crate::settings::text("文件不存在"), cx) };
         let picked = crate::devtools::take_pick().and_then(|p| p.into_iter().next());
         let dir = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_default();
         let rx = picked.is_none().then(|| cx.prompt_for_new_path(&dir, Some(&f.name)));
@@ -651,7 +682,7 @@ impl Editor {
             };
             let Some(dest) = dest else { return };
             bg.spawn(async move {
-                let _ = std::fs::copy(&src, &dest);
+                let _ = fdl_core::vfs::copy(&src, &dest);
             })
             .await;
         })
@@ -768,27 +799,28 @@ impl Editor {
                 f(e, id, window, cx);
             })
         };
-        let sep = || div().w(px(1.)).h(px(18.)).bg(Theme::line_divider());
-        let mut bar = div().h(px(40.)).px(px(8.)).flex().items_center().gap(px(8.));
-        let mut w = 16. + 2.;
-        let mut n = 0;
+        let sep = ButtonGroupSeparator::new;
+        let mut bar = Toolbar::new("file-toolbar").on_mouse_down(MouseButton::Left, |_, window, cx| {
+            cx.stop_propagation();
+            window.prevent_default();
+        });
+        let mut widths = vec![];
         if preview.is_some_and(|k| k != Kind::Audio) {
             let p = path.clone();
             bar = bar.child(
-                shell_btn("ftb-full").tip_above(crate::settings::text("全屏"), None).child(icon("maximize", 18., Theme::icon())).on_mouse_down(
+                tool_btn("ftb-full").editor_icon("maximize").tip_above(crate::settings::text("全屏"), None).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |e, _, window, cx| {
                         cx.stop_propagation();
                         window.prevent_default();
-                        e.open_file(p.as_deref(), cx);
+                        e.preview_file(p.as_deref(), cx);
                     }),
                 ),
             );
-            w += 24.;
-            n += 1;
+            widths.push(tw::BUTTON);
         }
         bar = bar
-            .child(shell_btn("ftb-download").tip_above(crate::settings::text("下载"), None).child(icon("download", 18., Theme::icon())).on_mouse_down(
+            .child(tool_btn("ftb-download").editor_icon("download").tip_above(crate::settings::text("下载"), None).on_mouse_down(
                 MouseButton::Left,
                 act(|e, id, _, cx| {
                     if let Some(BlockKind::File(f)) = e.core.kind_of(id).cloned() {
@@ -797,15 +829,14 @@ impl Editor {
                 }),
             ))
             .child(sep())
-            .child(shell_btn("ftb-text").tip_above(crate::settings::text("文本视图"), None).child(icon("view-text", 18., Theme::icon())).on_mouse_down(
+            .child(tool_btn("ftb-text").editor_icon("view-text").tip_above(crate::settings::text("文本视图"), None).on_mouse_down(
                 MouseButton::Left,
                 act(|e, id, window, cx| {
                     e.core.file_to_inline(id);
                     e.changed(window, cx);
                 }),
             ));
-        w += 24. + 1. + 24.;
-        n += 3;
+        widths.extend([tw::BUTTON, tw::SEPARATOR, tw::BUTTON]);
         let views: &[(&'static str, &'static str, &'static str, FileView)] = if preview.is_some() {
             &[("ftb-card", "view-card", "卡片视图", FileView::Card), ("ftb-preview", "view-preview", "预览视图", FileView::Preview)]
         } else {
@@ -814,10 +845,10 @@ impl Editor {
         for &(key, ic, tip, v) in views {
             let on = view == v || preview.is_none();
             bar = bar.child(
-                shell_btn(key)
-                    .when(on, |d| d.bg(Theme::fill_turninto_active()))
+                Toggle::new(key)
+                    .editor_icon(ic)
+                    .pressed(on)
                     .tip_above(tip, None)
-                    .child(icon(ic, 18., if on { Theme::primary() } else { Theme::icon() }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |e, _, window, cx| {
@@ -828,23 +859,13 @@ impl Editor {
                         }),
                     ),
             );
-            w += 24.;
-            n += 1;
+            widths.push(tw::TOGGLE);
         }
-        w += (n - 1) as f32 * 8.;
+        let (_, w) = toolbar_layout(&widths);
         let x = (f32::from(rect.center().x) - w / 2.).clamp(f32::from(viewport.left()) + 8., (f32::from(viewport.right()) - w - 8.).max(f32::from(viewport.left()) + 8.));
-        let h = 42.;
-        let above = f32::from(rect.top()) - 8. - h;
+        let above = f32::from(rect.top()) - 8. - TOOLBAR_H;
         let y = if above >= f32::from(viewport.top()) { above } else { f32::from(rect.bottom()) + 8. };
-        let el = popover()
-            .id("file-toolbar")
-            .occlude()
-            .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                cx.stop_propagation();
-                window.prevent_default();
-            })
-            .child(bar);
-        Some(at(self.rel(point(px(x), px(y))), Corner::TopLeft, el))
+        Some(at(self.rel(point(px(x), px(y))), Anchor::TopLeft, bar))
     }
 
     /// The hover card of an inline attachment: 下载 | 文本视图 · 卡片视图 ·
@@ -852,17 +873,13 @@ impl Editor {
     pub(super) fn file_card(&self, p: Pos, f: &FileBlock, cx: &mut Context<Self>) -> Option<AnyElement> {
         let r = self.probed(Probe::Button(p))?;
         let preview = previewable(&f.name);
-        let n = if preview { 4 } else { 3 };
-        let w = 2. + 16. + n as f32 * 24. + 1. + n as f32 * 8.;
+        // 下载 | 文本视图 卡片视图 (预览视图): the views are toggles, this one pressed
+        let n = if preview { 3 } else { 2 };
+        let (_, w) = toolbar_layout(&[&[tw::BUTTON, tw::SEPARATOR][..], &vec![tw::TOGGLE; n]].concat());
         let file = f.clone();
-        let sep = div().w(px(1.)).h(px(18.)).bg(Theme::line_divider());
-        let mut bar = div()
-            .h(px(40.))
-            .px(px(8.))
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .child(shell_btn("fcard-download").tip_above(crate::settings::text("下载"), None).child(icon("download", 18., Theme::icon())).on_mouse_down(
+        let sep = ButtonGroupSeparator::new();
+        let mut bar = Toolbar::new("file-card-pop")
+            .child(tool_btn("fcard-download").editor_icon("download").tip_above(crate::settings::text("下载"), None).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |e, _, window, cx| {
                     cx.stop_propagation();
@@ -872,29 +889,27 @@ impl Editor {
                 }),
             ))
             .child(sep)
-            .child(shell_btn("fcard-text").bg(Theme::fill_turninto_active()).tip_above(crate::settings::text("文本视图"), None).child(icon("view-text", 18., Theme::primary())));
+            .child(Toggle::new("fcard-text").editor_icon("view-text").pressed(true).tip_above(crate::settings::text("文本视图"), None));
         let views: &[(&'static str, &'static str, &'static str, FileView)] = if preview {
             &[("fcard-card", "view-card", "卡片视图", FileView::Card), ("fcard-preview", "view-preview", "预览视图", FileView::Preview)]
         } else {
             &[("fcard-card", "view-card", "卡片视图", FileView::Card)]
         };
         for &(key, ic, tip, v) in views {
-            bar = bar.child(shell_btn(key).tip_above(tip, None).child(icon(ic, 18., Theme::icon())).on_mouse_down(
+            bar = bar.child(Toggle::new(key).editor_icon(ic).tip_above(tip, None).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |e, _, window, cx| {
                     cx.stop_propagation();
                     window.prevent_default();
                     if e.core.inline_to_file(p, v).is_some() {
                         e.hide_button_card(cx);
-                        window.focus(&e.focus);
+                        window.focus(&e.focus, cx);
                         e.changed(window, cx);
                     }
                 }),
             ));
         }
-        let el = popover()
-            .id("file-card-pop")
-            .occlude()
+        let el = bar
             .on_hover(cx.listener(|e, h: &bool, _, cx| {
                 e.btn.card_over = *h;
                 e.sync_button_card(cx);
@@ -902,9 +917,8 @@ impl Editor {
             .on_mouse_down(MouseButton::Left, |_, window, cx| {
                 cx.stop_propagation();
                 window.prevent_default();
-            })
-            .child(bar);
-        Some(at(self.rel(point(r.center().x - px(w / 2.), r.top() - px(4.))), Corner::BottomLeft, el))
+            });
+        Some(at(self.rel(point(r.center().x - px(w / 2.), r.top() - px(4.))), Anchor::BottomLeft, el))
     }
 
     // ---- inserting
@@ -927,6 +941,8 @@ impl Editor {
     /// Copies `paths` into the library off the main thread, then inserts
     /// them at `target` (or the caret).
     pub(super) fn import_files(&mut self, paths: Vec<PathBuf>, target: Option<(BlockId, DropPlace)>, window: &mut Window, cx: &mut Context<Self>) {
+        // A Markdown file keeps no attachments (dropped images still come in as images).
+        if self.markdown { return; }
         let task = cx.background_executor().spawn(async move { paths.iter().map(|p| file_block_from_path(p)).collect::<Vec<_>>() });
         cx.spawn_in(window, async move |this, cx| {
             let blocks = task.await;
@@ -956,7 +972,7 @@ impl Editor {
                         e.core.sel = Selection::caret(Pos::new(p, 0));
                     }
                 }
-                window.focus(&e.focus);
+                window.focus(&e.focus, cx);
                 e.changed(window, cx);
             });
         })

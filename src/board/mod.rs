@@ -19,6 +19,7 @@ pub mod action;
 pub mod canvas;
 pub mod chrome;
 pub mod fonts;
+pub mod font_hint;
 pub mod frame_name;
 pub mod keys;
 pub mod overlay;
@@ -56,6 +57,8 @@ pub enum BoardEvent {
     Close,
     /// The elements changed (a committed step): save.
     Changed,
+    /// A note for the user (the window's toast).
+    Toast(String),
 }
 
 /// Room the chrome takes from the canvas edges when fitting (screen px):
@@ -138,6 +141,8 @@ pub struct BoardView {
     pub(crate) hits: RefCell<canvas::HitIndex>,
     /// The chrome's view (made on the first render).
     chrome: Option<Entity<chrome::ChromeView>>,
+    /// The note while the CJK handwriting font downloads (`font_hint`).
+    font_hint: Option<Entity<font_hint::FontHint>>,
     /// The next notify comes from a pointer move that leaves the chrome as
     /// it was (`chrome::ChromeView`).
     pub(crate) chrome_quiet: Cell<bool>,
@@ -181,13 +186,69 @@ impl BoardView {
             m: render::measure(window), painter: Rc::new(RefCell::new({ let mut p = render::Painter::default(); p.screen_frame_names = true; p })), focus: cx.focus_handle(), bounds: Rc::default(), gesture: None, space: false, fitted: false,
             linear: None, multi: None, suggested: None, snap_lines: vec![], text: None, frame_name: None, frame_labels: vec![], font_cache: None, font_previewing: false, refocus: false, hover_cursor: CursorStyle::Arrow, pointer: point(px(0.), px(0.)),
             menu: None, help: false, copied_styles: vec![], flowchart: FlowChartCreator::default(), navigator: FlowChartNavigator::default(),
-            faded: FxHashMap::default(), saved: 0, slider: false, aabbs: RefCell::default(), hits: RefCell::default(), chrome: None, chrome_quiet: Cell::new(false),
+            faded: FxHashMap::default(), saved: 0, slider: false, aabbs: RefCell::default(), hits: RefCell::default(), chrome: None, font_hint: None, chrome_quiet: Cell::new(false),
         };
         // the loaded scene is the baseline, not an undoable step
         v.store.schedule_action(CaptureUpdateAction::Never);
         let _ = v.store.commit(Some(v.scene.elements_including_deleted()), Some(&v.app));
         v.saved = v.scene_version();
+        cx.observe_global::<crate::font_downloads::Changed>(|me, cx| {
+            if cx.global::<crate::font_downloads::Changed>().ok && cx.global::<crate::font_downloads::Changed>().id == crate::font_downloads::XIAOLAI { me.fonts_arrived(cx) }
+        }).detach();
         v
+    }
+
+    /// Xiaolai arrived (`font_downloads::Changed`): CJK texts measured with the
+    /// fallbacks take their Xiaolai size (not an undo step; only texts whose
+    /// box changes are touched, so a board measured with Xiaolai elsewhere
+    /// stays as saved), and the cached shapes go.
+    fn fonts_arrived(&mut self, cx: &mut Context<Self>) {
+        use fdl_core::board::text::{redraw_text_bounding_box, refresh_text_dimensions};
+        let m = self.m.clone();
+        let stale: Vec<Element> = self.scene.non_deleted_elements().filter(|e| e.text().is_some_and(|t| fonts::needs_xiaolai(&t.original_text, t.font_family))).filter(|e| {
+            let t = e.text().unwrap();
+            let container = e.container_id().and_then(|c| self.scene.get_element(c));
+            refresh_text_dimensions(e, container, &self.scene, Some(&t.original_text), None, &*m)
+                .is_some_and(|d| d.text != t.text || (d.width - e.width).abs() > 0.01 || (d.height - e.height).abs() > 0.01)
+        }).cloned().collect();
+        for e in &stale { redraw_text_bounding_box(&mut self.scene, e, e.container_id(), &*m); }
+        self.painter.borrow_mut().clear();
+        if stale.is_empty() { cx.notify(); } else { self.commit(Some(CaptureUpdateAction::Never), cx); }
+    }
+
+    /// In the middle of something a scene from outside would pull from
+    /// under it: a gesture, a text or frame name being edited, a line drawn
+    /// click by click, a slider being dragged.
+    pub fn busy(&self) -> bool { self.gesture.is_some() || self.text.is_some() || self.frame_name.is_some() || self.multi.is_some() || self.slider }
+
+    /// The file changed outside (another program, an agent): its scene comes
+    /// in as upstream takes a collaborator's (`updateScene` with
+    /// `CaptureUpdateAction.NEVER`): not an undo step, nothing saved, the
+    /// viewport, tool and what is still selected left as they were. The
+    /// file's canvas color and grid come with it. Nothing happens when it is
+    /// what is shown already (a sibling window's edit coming back).
+    pub fn reload(&mut self, board: &Board, cx: &mut Context<Self>) {
+        if *self.board() == (Board { height: self.height, ..board.clone() }) { return }
+        let came: rustc_hash::FxHashSet<&str> = board.elements.iter().map(|e| e.id.as_str()).collect();
+        // Deleted elements stay for the undo history; those the file has again are its.
+        let gone = self.scene.elements_including_deleted().iter().filter(|e| e.is_deleted && !came.contains(e.id.as_str())).cloned();
+        let elements: Vec<Element> = board.elements.iter().cloned().chain(gone).collect();
+        self.scene.replace_all_elements(elements);
+        self.files.extend(board.files.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.app.apply_exported(&board.app);
+        let here: rustc_hash::FxHashSet<String> = self.scene.non_deleted_elements().map(|e| e.id.clone()).collect();
+        self.app.selected_element_ids.retain(|id| here.contains(id));
+        if self.app.selected_element_ids.is_empty() { self.app.selected_group_ids.clear(); self.app.editing_group_id = None; }
+        self.sync_linear();
+        self.menu = None;
+        // An outside writer may change an element without bumping its version: nothing cached by version holds.
+        self.aabbs.borrow_mut().clear();
+        *self.hits.borrow_mut() = canvas::HitIndex::default();
+        self.painter.borrow_mut().clear();
+        self.store.schedule_action(CaptureUpdateAction::Never);
+        let _ = self.store.commit(Some(self.scene.elements_including_deleted()), Some(&self.app));
+        self.saved = self.scene_version();
+        cx.notify();
     }
 
     // ---- what the chrome reads and calls
@@ -277,13 +338,13 @@ impl BoardView {
         if ty == ToolType::FreeDraw { self.store.schedule_capture(); }
         self.commit(None, cx);
         if ty == ToolType::Image { tools::image::pick_images(self, window, cx); }
-        self.focus(window);
+        self.focus(window, cx);
     }
 
     /// `run`: one user action (toolbar, panel, menu or shortcut).
     pub fn run(&mut self, a: BoardAction, window: &mut Window, cx: &mut Context<Self>) { run::run(self, a, window, cx) }
 
-    pub fn focus(&self, window: &mut Window) { window.focus(&self.focus); }
+    pub fn focus(&self, window: &mut Window, cx: &mut App) { window.focus(&self.focus, cx); }
 
     // ---- state helpers
 
@@ -409,13 +470,14 @@ impl BoardView {
 impl Render for BoardView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         text_editor::restyle(self, window, cx);
-        if std::mem::take(&mut self.refocus) && self.text.is_none() && self.frame_name.is_none() { self.focus(window); }
+        if std::mem::take(&mut self.refocus) && self.text.is_none() && self.frame_name.is_none() { self.focus(window, cx); }
         let canvas_el = canvas::canvas_element(self, cx).into_any_element();
-        let editor = text_editor::element(self);
+        let editor = text_editor::element(self, window);
         let labels = frame_name::labels(self, window);
         let frame_name = frame_name::element(self, cx);
         let me = cx.entity();
         let chrome = self.chrome.get_or_insert_with(|| cx.new(|cx| chrome::ChromeView::new(&me, cx))).clone();
+        let hint = self.font_hint.get_or_insert_with(|| cx.new(font_hint::FontHint::new)).clone();
         div()
             .id("board")
             .key_context("Board")
@@ -424,7 +486,7 @@ impl Render for BoardView {
             .relative()
             .size_full()
             .bg(render::color(color::color_or_black(&self.app.view_background_color), 1.))
-            .font_family(crate::theme::UI_FONT)
+            .font_family(crate::theme::DOC_UI_FONT)
             .cursor(canvas::cursor(self))
             .map(|d| keys::listeners(d, cx))
             .map(|d| canvas::listeners(d, cx))
@@ -434,6 +496,7 @@ impl Render for BoardView {
             .child(div().absolute().top_0().left_0().size_full().overflow_hidden().children(labels).children(frame_name))
             .children(editor)
             .child(AnyView::from(chrome).cached(StyleRefinement::default().absolute().top_0().left_0().size_full()))
+            .child(hint)
             .children(canvas::capture_layer(self, cx))
     }
 }

@@ -1,0 +1,827 @@
+//! 数据表 (多维表格) model: a `Base` is one SQLite file holding tables; a
+//! table has typed fields, records and views. Ids are random integers below
+//! 2^53 (`IdGen`), so two copies of a file edited apart don't hand out the same
+//! one; what a reader of the file sees is the table, column and option names
+//! (`sqlite.rs`).
+
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+pub type TableId = u64;
+pub type FieldId = u64;
+pub type ViewId = u64;
+pub type OptId = u64;
+/// A record's id: its SQLite rowid.
+pub type RecId = u64;
+
+/// Ids stay below 2^53: a 关联 cell holds record ids as JSON numbers, which JavaScript reads exactly only up to there.
+pub const ID_LIMIT: u64 = 1 << 53;
+
+/// The field types, in 飞书's picker order within their groups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldType {
+    Text, SingleSelect, MultiSelect, Person, Date, Attachment, Number, Checkbox, Url, Formula, Lookup,
+    AutoNumber, Phone, Email, Location, Barcode, Progress, Currency, Rating,
+    Link, CreatedTime, ModifiedTime,
+    /// 笔记: a cell is one note, a document of the library; the cell holds where it is (`field::note_rel`).
+    Note,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldGroup { General, Business, Advanced }
+
+impl FieldGroup {
+    pub fn label(self) -> &'static str {
+        match self { FieldGroup::General => "常规", FieldGroup::Business => "业务", FieldGroup::Advanced => "高级" }
+    }
+}
+
+impl FieldType {
+    pub const ALL: &'static [FieldType] = {
+        use FieldType::*;
+        &[Text, SingleSelect, MultiSelect, Person, Date, Attachment, Number, Checkbox, Url, Formula, Lookup,
+          AutoNumber, Phone, Email, Location, Barcode, Progress, Currency, Rating,
+          Link, CreatedTime, ModifiedTime, Note]
+    };
+
+    pub fn label(self) -> &'static str {
+        use FieldType::*;
+        match self {
+            Text => "文本", SingleSelect => "单选", MultiSelect => "多选", Person => "人员", Date => "日期",
+            Attachment => "附件", Number => "数字", Checkbox => "复选框", Url => "超链接", Formula => "公式",
+            Lookup => "查找引用", AutoNumber => "自动编号", Phone => "电话号码", Email => "Email",
+            Location => "地理位置", Barcode => "条码", Progress => "进度", Currency => "货币", Rating => "评分",
+            Link => "关联", CreatedTime => "创建时间", ModifiedTime => "最后更新时间", Note => "笔记",
+        }
+    }
+
+    /// The name in the file's `_fields.type` column and in `.sqlite` exports.
+    pub fn key(self) -> &'static str {
+        use FieldType::*;
+        match self {
+            Text => "text", SingleSelect => "single_select", MultiSelect => "multi_select", Person => "person", Date => "date",
+            Attachment => "attachment", Number => "number", Checkbox => "checkbox", Url => "url", Formula => "formula",
+            Lookup => "lookup", AutoNumber => "auto_number", Phone => "phone", Email => "email",
+            Location => "location", Barcode => "barcode", Progress => "progress", Currency => "currency", Rating => "rating",
+            Link => "link", CreatedTime => "created_time", ModifiedTime => "modified_time", Note => "note",
+        }
+    }
+
+    pub fn from_key(k: &str) -> Option<FieldType> { Self::ALL.iter().copied().find(|t| t.key() == k) }
+
+    pub fn group(self) -> FieldGroup {
+        use FieldType::*;
+        match self {
+            Text | SingleSelect | MultiSelect | Person | Date | Attachment | Number | Checkbox | Url | Formula | Lookup => FieldGroup::General,
+            AutoNumber | Phone | Email | Location | Barcode | Progress | Currency | Rating => FieldGroup::Business,
+            Link | CreatedTime | ModifiedTime | Note => FieldGroup::Advanced,
+        }
+    }
+
+    /// Computed from other cells or the record itself: never edited.
+    pub fn computed(self) -> bool {
+        matches!(self, FieldType::Formula | FieldType::Lookup | FieldType::AutoNumber | FieldType::CreatedTime | FieldType::ModifiedTime)
+    }
+
+    /// A cell's value can be put in another cell as it is (paste, fill, a
+    /// duplicated record or column). Not what is computed, and not a 笔记:
+    /// the note is one record's, a second cell would share it.
+    pub fn copies(self) -> bool { !self.computed() && self != FieldType::Note }
+
+    /// Values are numbers (right-aligned, summed, formatted by `NumberFmt`).
+    pub fn numeric(self) -> bool {
+        matches!(self, FieldType::Number | FieldType::Currency | FieldType::Progress | FieldType::Rating | FieldType::AutoNumber)
+    }
+
+    /// Values are option ids of the field.
+    pub fn select(self) -> bool { matches!(self, FieldType::SingleSelect | FieldType::MultiSelect | FieldType::Person) }
+
+    /// Values are one line of text typed in place.
+    pub fn textual(self) -> bool {
+        matches!(self, FieldType::Text | FieldType::Url | FieldType::Phone | FieldType::Email | FieldType::Location | FieldType::Barcode)
+    }
+
+    pub fn is_date(self) -> bool { matches!(self, FieldType::Date | FieldType::CreatedTime | FieldType::ModifiedTime) }
+
+    /// Can be marked 唯一键 (`FieldOpts::unique`): a value people key records by.
+    /// Not what is computed (自动编号 is unique as it is), dates, links or files.
+    pub fn keyable(self) -> bool {
+        matches!(self, FieldType::Text | FieldType::Number | FieldType::Url | FieldType::Email | FieldType::Phone | FieldType::Barcode | FieldType::SingleSelect)
+    }
+}
+
+/// A 单选 / 多选 / 人员 option. `color` is a slot of the tag palette.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SelectOption {
+    pub id: OptId,
+    pub name: String,
+    #[serde(default)]
+    pub color: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NumberStyle { #[default] Plain, Thousands, Percent }
+
+/// 日期格式, 飞书's list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DateFmt {
+    /// 2026/01/30
+    #[default]
+    Slash,
+    /// 2026-01-30
+    Dash,
+    /// 01-30
+    MonthDay,
+    /// 01/30/2026
+    Us,
+    /// 30/01/2026
+    Eu,
+    /// 2026年1月30日
+    Cn,
+    /// 1月30日
+    CnMonthDay,
+}
+
+impl DateFmt {
+    pub const ALL: &'static [DateFmt] = &[DateFmt::Slash, DateFmt::Dash, DateFmt::MonthDay, DateFmt::Us, DateFmt::Eu, DateFmt::Cn, DateFmt::CnMonthDay];
+    pub fn sample(self) -> &'static str {
+        match self {
+            DateFmt::Slash => "2026/01/30", DateFmt::Dash => "2026-01-30", DateFmt::MonthDay => "01-30", DateFmt::Us => "01/30/2026",
+            DateFmt::Eu => "30/01/2026", DateFmt::Cn => "2026年1月30日", DateFmt::CnMonthDay => "1月30日",
+        }
+    }
+}
+
+/// How a 查找引用 folds the values it finds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rollup { #[default] Values, Unique, Sum, Average, Min, Max, Count, CountAll, Concat }
+
+impl Rollup {
+    pub const ALL: &'static [Rollup] = &[Rollup::Values, Rollup::Unique, Rollup::Sum, Rollup::Average, Rollup::Min, Rollup::Max, Rollup::Count, Rollup::CountAll, Rollup::Concat];
+    pub fn label(self) -> &'static str {
+        match self {
+            Rollup::Values => "原样引用", Rollup::Unique => "去重", Rollup::Sum => "求和", Rollup::Average => "平均值", Rollup::Min => "最小值",
+            Rollup::Max => "最大值", Rollup::Count => "计数（非空）", Rollup::CountAll => "计数", Rollup::Concat => "合并文本",
+        }
+    }
+}
+
+/// A field's settings. Flat, every member defaulted, so a new setting never
+/// breaks an older file.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FieldOpts {
+    /// 单选 / 多选 / 人员.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<SelectOption>,
+    /// 数字 / 货币 / 进度 / 公式: digits after the point (None: as typed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precision: Option<u8>,
+    #[serde(skip_serializing_if = "is_default")]
+    pub style: NumberStyle,
+    /// 货币 symbol (`¥`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub currency: String,
+    #[serde(skip_serializing_if = "is_default")]
+    pub date: DateFmt,
+    /// 日期 shows the time of day too.
+    #[serde(skip_serializing_if = "is_default")]
+    pub time: bool,
+    /// 评分's number of stars (0: five).
+    #[serde(skip_serializing_if = "is_default")]
+    pub max: u8,
+    /// 公式.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub formula: String,
+    /// 关联: the other table, and whether a cell may hold several records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_table: Option<TableId>,
+    #[serde(skip_serializing_if = "is_default")]
+    pub single: bool,
+    /// 双向关联: the mirror field in the other table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub back: Option<FieldId>,
+    /// 查找引用: through which 关联 field, which field of the other table, folded how.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<FieldId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<FieldId>,
+    #[serde(skip_serializing_if = "is_default")]
+    pub rollup: Rollup,
+    /// 自动编号 prefix.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    /// 新记录's value, as text the field parses (`field::parse`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub default: String,
+    /// 唯一键: records are told apart by this field's value (`Table::find_unique`).
+    /// Only marked: nothing stops two records sharing a value. `FieldType::keyable` fields only.
+    #[serde(skip_serializing_if = "is_default")]
+    pub unique: bool,
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool { *v == T::default() }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Field {
+    pub id: FieldId,
+    pub name: String,
+    pub ty: FieldType,
+    pub opts: FieldOpts,
+    pub desc: String,
+}
+
+impl Field {
+    pub fn option(&self, id: OptId) -> Option<&SelectOption> { self.opts.options.iter().find(|o| o.id == id) }
+    pub fn option_named(&self, name: &str) -> Option<&SelectOption> { self.opts.options.iter().find(|o| o.name == name) }
+    pub fn stars(&self) -> u8 { if self.opts.max == 0 { 5 } else { self.opts.max.min(10) } }
+}
+
+/// A file in an 附件 cell: a path relative to the library (`.assets/…`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub path: String,
+    pub name: String,
+}
+
+/// One cell.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum Value {
+    #[default]
+    Empty,
+    Text(String),
+    Number(f64),
+    Bool(bool),
+    /// Wall-clock milliseconds since 1970 (no time zone: what was typed is what shows).
+    Date(i64),
+    /// Option ids, in the order picked.
+    Select(Vec<OptId>),
+    /// Records of the 关联 field's table.
+    Links(Vec<RecId>),
+    Files(Vec<Attachment>),
+    /// 查找引用 (原样引用): the values found, one per linked record.
+    List(Vec<Value>),
+    /// A formula that could not be computed (`#ERROR` and the like).
+    Error(String),
+}
+
+impl Value {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Value::Empty => true,
+            Value::Text(s) => s.is_empty(),
+            Value::Bool(b) => !b,
+            Value::Select(v) => v.is_empty(),
+            Value::Links(v) => v.is_empty(),
+            Value::Files(v) => v.is_empty(),
+            Value::List(v) => v.iter().all(Value::is_empty),
+            Value::Number(_) | Value::Date(_) | Value::Error(_) => false,
+        }
+    }
+    /// The same cell with empties spelled one way.
+    pub fn normal(self) -> Value { if self.is_empty() { Value::Empty } else { self } }
+    pub fn as_number(&self) -> Option<f64> {
+        match self { Value::Number(n) => Some(*n), Value::Bool(b) => Some(*b as u8 as f64), _ => None }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Record {
+    pub id: RecId,
+    pub cells: HashMap<FieldId, Value>,
+    /// Wall-clock milliseconds.
+    pub created: i64,
+    pub modified: i64,
+    /// Who made it and who changed it last (`Base::writer`); None: not known (a row another program wrote).
+    pub created_by: Option<String>,
+    pub updated_by: Option<String>,
+    /// 自动编号's number: handed out once, never reused.
+    pub auto: u64,
+    /// Sort key of the manual order (`order.rs`): rises strictly along `Table::records`.
+    pub ord: String,
+}
+
+pub static EMPTY: Value = Value::Empty;
+
+impl Record {
+    pub fn get(&self, f: FieldId) -> &Value { self.cells.get(&f).unwrap_or(&EMPTY) }
+    pub fn set(&mut self, f: FieldId, v: Value) { if v.is_empty() { self.cells.remove(&f); } else { self.cells.insert(f, v); } }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// `Fit`: each row as tall as its content needs at the columns' widths (the grid measures it; `px` is
+/// its one-line height).
+pub enum RowHeight { #[default] Short, Medium, Tall, ExtraTall, Fit }
+
+impl RowHeight {
+    pub const ALL: &'static [RowHeight] = &[RowHeight::Short, RowHeight::Medium, RowHeight::Tall, RowHeight::ExtraTall, RowHeight::Fit];
+    pub fn px(self) -> f32 { match self { RowHeight::Short => 36., RowHeight::Medium => 44., RowHeight::Tall => 88., RowHeight::ExtraTall => 128., RowHeight::Fit => 36. } }
+    pub fn label(self) -> &'static str { match self { RowHeight::Short => "低", RowHeight::Medium => "中等", RowHeight::Tall => "高", RowHeight::ExtraTall => "超高", RowHeight::Fit => "适应内容" } }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// A file's old 画册 view reads back as 表格 (an unknown kind is the default).
+pub enum ViewKind { #[default] Grid, Kanban, Calendar, Gantt, Form }
+
+impl ViewKind {
+    pub const ALL: &'static [ViewKind] = &[ViewKind::Grid, ViewKind::Kanban, ViewKind::Calendar, ViewKind::Gantt, ViewKind::Form];
+    pub fn label(self) -> &'static str {
+        match self { ViewKind::Grid => "表格视图", ViewKind::Kanban => "看板视图", ViewKind::Calendar => "日历视图", ViewKind::Gantt => "甘特视图", ViewKind::Form => "表单视图" }
+    }
+    pub fn short(self) -> &'static str {
+        match self { ViewKind::Grid => "表格", ViewKind::Kanban => "看板", ViewKind::Calendar => "日历", ViewKind::Gantt => "甘特图", ViewKind::Form => "表单" }
+    }
+}
+
+/// 筛选 operators; which apply to a field is `query::ops_for`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterOp {
+    Is, IsNot, Contains, NotContains, Empty, NotEmpty,
+    Gt, Ge, Lt, Le,
+    /// 日期: 早于 / 晚于 (等于 is `Is`).
+    Before, After,
+}
+
+impl FilterOp {
+    pub fn label(self) -> &'static str {
+        match self {
+            FilterOp::Is => "等于", FilterOp::IsNot => "不等于", FilterOp::Contains => "包含", FilterOp::NotContains => "不包含",
+            FilterOp::Empty => "为空", FilterOp::NotEmpty => "不为空", FilterOp::Gt => ">", FilterOp::Ge => "≥", FilterOp::Lt => "<", FilterOp::Le => "≤",
+            FilterOp::Before => "早于", FilterOp::After => "晚于",
+        }
+    }
+    pub fn needs_value(self) -> bool { !matches!(self, FilterOp::Empty | FilterOp::NotEmpty) }
+}
+
+/// A 日期 condition's value: a day, or one relative to today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DateRef {
+    #[default]
+    Exact, Today, Tomorrow, Yesterday, ThisWeek, LastWeek, NextWeek, ThisMonth, LastMonth, NextMonth, Past7, Next7, Past30, Next30,
+}
+
+impl DateRef {
+    pub const ALL: &'static [DateRef] = &[DateRef::Exact, DateRef::Today, DateRef::Tomorrow, DateRef::Yesterday, DateRef::ThisWeek, DateRef::LastWeek,
+        DateRef::NextWeek, DateRef::ThisMonth, DateRef::LastMonth, DateRef::NextMonth, DateRef::Past7, DateRef::Next7, DateRef::Past30, DateRef::Next30];
+    pub fn label(self) -> &'static str {
+        match self {
+            DateRef::Exact => "具体日期", DateRef::Today => "今天", DateRef::Tomorrow => "明天", DateRef::Yesterday => "昨天",
+            DateRef::ThisWeek => "本周", DateRef::LastWeek => "上周", DateRef::NextWeek => "下周",
+            DateRef::ThisMonth => "本月", DateRef::LastMonth => "上月", DateRef::NextMonth => "下月",
+            DateRef::Past7 => "过去 7 天内", DateRef::Next7 => "未来 7 天内", DateRef::Past30 => "过去 30 天内", DateRef::Next30 => "未来 30 天内",
+        }
+    }
+}
+
+/// One 筛选 condition. `value` is text the field parses (option names for
+/// selects, joined with `,`); `date` picks a relative day instead.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Cond {
+    pub field: FieldId,
+    pub op: FilterOp,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub value: String,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub date: DateRef,
+}
+
+/// 筛选: conditions joined by 且 (`all`) or 或.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Filter {
+    pub all: bool,
+    pub conds: Vec<Cond>,
+}
+
+impl Default for Filter {
+    fn default() -> Self { Filter { all: true, conds: vec![] } }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SortBy {
+    pub field: FieldId,
+    #[serde(default)]
+    pub desc: bool,
+}
+
+/// 统计 at the foot of a column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stat { Count, Filled, Empty, Unique, PercentFilled, PercentEmpty, Sum, Average, Min, Max, Earliest, Latest, Checked, Unchecked }
+
+impl Stat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Stat::Count => "记录总数", Stat::Filled => "已填写", Stat::Empty => "未填写", Stat::Unique => "唯一值",
+            Stat::PercentFilled => "已填写占比", Stat::PercentEmpty => "未填写占比", Stat::Sum => "求和", Stat::Average => "平均值",
+            Stat::Min => "最小值", Stat::Max => "最大值", Stat::Earliest => "最早", Stat::Latest => "最晚",
+            Stat::Checked => "已勾选", Stat::Unchecked => "未勾选",
+        }
+    }
+}
+
+/// 填色: rows matching `filter` take the palette slot `color`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ColorRule {
+    pub filter: Filter,
+    pub color: u8,
+}
+
+/// A view's settings, all of it saved (as one JSON object in `_views`).
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ViewOpts {
+    /// Field order in this view; fields not listed follow in table order.
+    pub order: Vec<FieldId>,
+    pub hidden: HashSet<FieldId>,
+    pub widths: BTreeMap<FieldId, f32>,
+    /// Leading columns that stay put when scrolling sideways (none unless asked for).
+    pub frozen: usize,
+    pub row_height: RowHeight,
+    pub filter: Filter,
+    pub sorts: Vec<SortBy>,
+    pub groups: Vec<SortBy>,
+    pub stats: BTreeMap<FieldId, Stat>,
+    pub colors: Vec<ColorRule>,
+    /// 看板: the 单选 / 人员 field its columns come from.
+    pub stack: Option<FieldId>,
+    /// 看板: the 附件 field whose first image is the card's cover.
+    pub cover: Option<FieldId>,
+    /// 日历 / 甘特: start and end 日期 fields.
+    pub date: Option<FieldId>,
+    pub end: Option<FieldId>,
+    /// Group headers folded shut, by their key (`query::Group::key`).
+    pub folded: HashSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct View {
+    pub id: ViewId,
+    pub name: String,
+    pub kind: ViewKind,
+    pub opts: ViewOpts,
+}
+
+pub const DEFAULT_WIDTH: f32 = 180.;
+pub const PRIMARY_WIDTH: f32 = 240.;
+pub const MIN_WIDTH: f32 = 60.;
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Table {
+    pub id: TableId,
+    pub name: String,
+    /// The first field is the 标题 (primary) column: always there, always text-like.
+    pub fields: Vec<Field>,
+    /// In manual (drag) order.
+    pub records: Vec<Record>,
+    pub views: Vec<View>,
+    pub next_auto: u64,
+}
+
+impl Table {
+    pub fn field(&self, id: FieldId) -> Option<&Field> { self.fields.iter().find(|f| f.id == id) }
+    pub fn field_mut(&mut self, id: FieldId) -> Option<&mut Field> { self.fields.iter_mut().find(|f| f.id == id) }
+    pub fn field_named(&self, name: &str) -> Option<&Field> { self.fields.iter().find(|f| f.name == name) }
+    pub fn primary(&self) -> Option<&Field> { self.fields.first() }
+    pub fn view(&self, id: ViewId) -> Option<&View> { self.views.iter().find(|v| v.id == id) }
+    pub fn view_mut(&mut self, id: ViewId) -> Option<&mut View> { self.views.iter_mut().find(|v| v.id == id) }
+    pub fn record(&self, id: RecId) -> Option<&Record> { self.records.iter().find(|r| r.id == id) }
+    pub fn record_mut(&mut self, id: RecId) -> Option<&mut Record> { self.records.iter_mut().find(|r| r.id == id) }
+
+    /// The first record whose value of `field` is `v` (by `unique_key`): what an
+    /// upsert by 唯一键 updates. None for an empty value or a field that can't be a key.
+    pub fn find_unique(&self, field: FieldId, v: &Value) -> Option<RecId> {
+        let f = self.field(field)?;
+        let k = unique_key(f, v)?;
+        self.records.iter().find(|r| unique_key(f, r.get(field)).as_ref() == Some(&k)).map(|r| r.id)
+    }
+
+    /// The records that share a value of `field` with another, a group per value,
+    /// in row order (groups by their first record). Empty values share nothing.
+    pub fn duplicates(&self, field: FieldId) -> Vec<Vec<RecId>> {
+        let Some(f) = self.field(field) else { return vec![] };
+        let mut groups: Vec<Vec<RecId>> = vec![];
+        let mut at: HashMap<Key, usize> = HashMap::new();
+        for r in &self.records {
+            let Some(k) = unique_key(f, r.get(field)) else { continue };
+            match at.get(&k) { Some(&i) => groups[i].push(r.id), None => { at.insert(k, groups.len()); groups.push(vec![r.id]); } }
+        }
+        groups.retain(|g| g.len() > 1);
+        groups
+    }
+    /// Its own id, its fields', their options' and its views'.
+    pub fn all_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        [self.id].into_iter().chain(self.fields.iter().flat_map(|f| [f.id].into_iter().chain(f.opts.options.iter().map(|o| o.id)))).chain(self.views.iter().map(|v| v.id))
+    }
+    pub fn index_of(&self, id: RecId) -> Option<usize> { self.records.iter().position(|r| r.id == id) }
+
+    /// The fields a view shows, in its order.
+    pub fn visible_fields(&self, view: &View) -> Vec<&Field> {
+        self.ordered_fields(view).into_iter().filter(|f| !view.opts.hidden.contains(&f.id)).collect()
+    }
+
+    /// Every field in the view's order (hidden ones too); the primary field leads.
+    pub fn ordered_fields(&self, view: &View) -> Vec<&Field> {
+        let mut out: Vec<&Field> = Vec::with_capacity(self.fields.len());
+        let primary = self.fields.first().map(|f| f.id);
+        out.extend(self.fields.first());
+        for id in &view.opts.order {
+            if Some(*id) != primary && !out.iter().any(|f| f.id == *id) && let Some(f) = self.field(*id) { out.push(f); }
+        }
+        for f in &self.fields { if !out.iter().any(|o| o.id == f.id) { out.push(f); } }
+        out
+    }
+
+    pub fn width(&self, view: &View, f: FieldId) -> f32 {
+        view.opts.widths.get(&f).copied().unwrap_or(if self.fields.first().is_some_and(|p| p.id == f) { PRIMARY_WIDTH } else { DEFAULT_WIDTH })
+    }
+
+    /// A record's title: its primary cell as text.
+    pub fn title(&self, r: &Record) -> String {
+        self.primary().map(|f| super::field::display(self, f, r.get(f.id))).unwrap_or_default()
+    }
+
+    /// A name no other field has (SQLite column names compare without case).
+    pub fn free_field_name(&self, want: &str, except: Option<FieldId>) -> String {
+        free_name(want, |n| super::sqlite_name_ok(n) && !self.fields.iter().any(|f| Some(f.id) != except && f.name.eq_ignore_ascii_case(n)))
+    }
+
+    pub fn free_view_name(&self, want: &str) -> String { free_name(want, |n| !self.views.iter().any(|v| v.name == n)) }
+}
+
+/// `want`, or `want 2`, `want 3`… until `ok`.
+/// A value as a 唯一键 compares: text trimmed, then exactly (case counts);
+/// numbers by value (1 is 1.0); a 单选 by its option's name. None: empty, or not a key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Key { Text(String), Number(u64) }
+
+pub fn unique_key(f: &Field, v: &Value) -> Option<Key> {
+    let text = |s: &str| Some(s.trim()).filter(|s| !s.is_empty()).map(|s| Key::Text(s.to_string()));
+    match (f.ty, v) {
+        (t, _) if !t.keyable() => None,
+        // + 0.0: -0 is 0
+        (FieldType::Number, Value::Number(n)) if n.is_finite() => Some(Key::Number((n + 0.).to_bits())),
+        (FieldType::Number, Value::Text(s)) => super::field::parse_number(s).filter(|n| n.is_finite()).map(|n| Key::Number((n + 0.).to_bits())),
+        (FieldType::SingleSelect, Value::Select(ids)) => ids.first().and_then(|id| f.option(*id)).and_then(|o| text(&o.name)),
+        (FieldType::Number, _) => None,
+        (_, Value::Text(s)) => text(s),
+        (_, Value::Number(n)) => text(&super::field::plain_number(*n)),
+        _ => None,
+    }
+}
+
+pub fn free_name(want: &str, ok: impl Fn(&str) -> bool) -> String {
+    // what no file can carry as a name is dropped first (`sqlite_name_ok`), so a number always helps
+    let want = want.trim().trim_start_matches('_').replace('\0', "");
+    let want = match want.to_ascii_lowercase().as_str() { "" => "未命名".to_string(), l if l.starts_with("sqlite_") => format!("表 {want}"), _ => want };
+    if ok(&want) { return want; }
+    (2..100_000).map(|i| format!("{want} {i}")).find(|n| ok(n)).unwrap_or_else(|| format!("{want} {}", uuid::Uuid::new_v4()))
+}
+
+/// Hands out ids: random in [1, 2^53), never one it has handed out or been
+/// told is taken. Seeded from a v4 uuid; tests seed it to repeat a run.
+#[derive(Clone)]
+pub struct IdGen {
+    state: u64,
+    taken: HashSet<u64>,
+}
+
+impl IdGen {
+    pub fn seeded(seed: u64) -> IdGen { IdGen { state: seed, taken: HashSet::new() } }
+    /// splitmix64, cut to 53 bits.
+    fn raw(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        mix(self.state) >> 11
+    }
+    /// A fresh id that `busy` doesn't refuse either.
+    pub fn fresh_unless(&mut self, busy: impl Fn(u64) -> bool) -> u64 {
+        loop { let id = self.raw(); if id != 0 && !busy(id) && self.taken.insert(id) { return id; } }
+    }
+    pub fn fresh(&mut self) -> u64 { self.fresh_unless(|_| false) }
+    /// A `stable_id` nothing here has, taken: for what a file is given as it is read.
+    pub fn stable(&mut self, kind: IdKind, old: u64, table: u64, seq: u64) -> u64 {
+        let id = stable_id(kind, old, table, seq, |x| self.taken.contains(&x));
+        self.taken.insert(id);
+        id
+    }
+    /// Ids that are in use without having come from here (read from a file).
+    pub fn take(&mut self, ids: impl IntoIterator<Item = u64>) { self.taken.extend(ids); }
+}
+
+/// splitmix64's finalizer.
+fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// What a replaced id was: the hash of `stable_id` tells them apart.
+#[derive(Clone, Copy)]
+pub enum IdKind { Table = 1, Field, View, Option, Record }
+
+/// The id for something whose id in the file can't be kept (0, a duplicate,
+/// 2^53 or more): a hash of what it is, the id it had, its table's id (0 for a
+/// table) and where it is in the file, so every device that reads the same file
+/// gives it the same one, and two copies merge without one side's id seeming
+/// deleted and another's added. Below 2^53; one `taken` says is in use is passed
+/// for the next one up (from 2^53 - 1 round to 1). Not std's hasher: it may
+/// change between Rust versions.
+pub fn stable_id(kind: IdKind, old: u64, table: u64, seq: u64, taken: impl Fn(u64) -> bool) -> u64 {
+    let h = [kind as u64, old, table, seq].iter().fold(0x5157_4D44_7461_626Cu64, |h, p| mix(h.wrapping_add(0x9E37_79B9_7F4A_7C15) ^ *p));
+    free_from((h >> 11).max(1), taken)
+}
+
+/// `id`, or the first after it that isn't `taken` (past 2^53 - 1: from 1).
+fn free_from(mut id: u64, taken: impl Fn(u64) -> bool) -> u64 {
+    while taken(id) { id = if id + 1 >= ID_LIMIT { 1 } else { id + 1 }; }
+    id
+}
+
+impl Default for IdGen {
+    fn default() -> IdGen { let b = uuid::Uuid::new_v4().into_bytes(); IdGen::seeded(u64::from_le_bytes(b[..8].try_into().unwrap_or_default())) }
+}
+// bookkeeping, not content: two bases with the same tables are equal
+impl PartialEq for IdGen { fn eq(&self, _: &IdGen) -> bool { true } }
+impl std::fmt::Debug for IdGen {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "IdGen({} taken)", self.taken.len()) }
+}
+
+/// Who edits (`Record::created_by` / `updated_by`): `user` in the app; an
+/// agent writing through the app's interface gives its name (`agent:<name>`).
+#[derive(Clone)]
+pub struct Writer(pub String);
+
+impl Default for Writer { fn default() -> Writer { Writer("user".into()) } }
+// who is editing now, not content
+impl PartialEq for Writer { fn eq(&self, _: &Writer) -> bool { true } }
+impl std::fmt::Debug for Writer {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "Writer({:?})", self.0) }
+}
+
+/// One file: its tables, in tab order.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Base {
+    pub tables: Vec<Table>,
+    pub ids: IdGen,
+    /// Who the edits made now are by: not saved as such, stamped on the records they touch.
+    pub writer: Writer,
+}
+
+impl Base {
+    /// The table, field, view and option ids in use.
+    pub fn all_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.tables.iter().flat_map(Table::all_ids)
+    }
+    /// A fresh id for a table, field, view or option: none in the base has it.
+    pub fn new_id(&mut self) -> u64 {
+        let tables = &self.tables;
+        self.ids.fresh_unless(|id| tables.iter().any(|t| t.id == id || t.views.iter().any(|v| v.id == id) || t.fields.iter().any(|f| f.id == id || f.option(id).is_some())))
+    }
+    /// The id generator, to hand out ids while the base is borrowed (options
+    /// made by `field::parse_new`); it knows every id in the base. Put it back
+    /// in `ids` after.
+    pub fn take_ids(&mut self) -> IdGen { let mut g = std::mem::replace(&mut self.ids, IdGen::seeded(0)); g.take(self.all_ids()); g }
+    /// `n` fresh record ids for table `t`: none of its records has one.
+    pub fn new_rec_ids(&mut self, t: TableId, n: usize) -> Vec<RecId> {
+        let have: HashSet<RecId> = self.table(t).map(|t| t.records.iter().map(|r| r.id).collect()).unwrap_or_default();
+        (0..n).map(|_| self.ids.fresh_unless(|id| have.contains(&id))).collect()
+    }
+    pub fn table(&self, id: TableId) -> Option<&Table> { self.tables.iter().find(|t| t.id == id) }
+    pub fn table_mut(&mut self, id: TableId) -> Option<&mut Table> { self.tables.iter_mut().find(|t| t.id == id) }
+    pub fn table_named(&self, name: &str) -> Option<&Table> { self.tables.iter().find(|t| t.name == name) }
+    pub fn free_table_name(&self, want: &str, except: Option<TableId>) -> String {
+        free_name(want, |n| super::sqlite_name_ok(n) && !self.tables.iter().any(|t| Some(t.id) != except && t.name.eq_ignore_ascii_case(n)))
+    }
+
+    /// A blank table: five 文本 columns (文本 1 … 文本 5, the first is the title), five empty rows, one 表格 view.
+    pub fn blank_table(&mut self, name: &str, now: i64) -> Table { self.blank_table_in(name, "文本", now) }
+
+    /// `blank_table` with its columns called `column` 1 … 5 (the interface language's word for 文本).
+    pub fn blank_table_in(&mut self, name: &str, column: &str, now: i64) -> Table {
+        let name = self.free_table_name(name, None);
+        let mut t = Table { id: self.new_id(), name, next_auto: 1, ..Default::default() };
+        for i in 1..=5 {
+            t.fields.push(Field { id: self.new_id(), name: format!("{column} {i}"), ty: FieldType::Text, opts: FieldOpts::default(), desc: String::new() });
+        }
+        // the table isn't in the base yet: its ids only have to differ from each other
+        for ord in super::order::keys_between(None, None, 5) {
+            t.records.push(Record { id: self.ids.fresh(), created: now, modified: now, created_by: Some(self.writer.0.clone()), updated_by: Some(self.writer.0.clone()), auto: t.next_auto, ord, ..Default::default() });
+            t.next_auto += 1;
+        }
+        t.views.push(View { id: self.new_id(), name: "表格视图".into(), kind: ViewKind::Grid, opts: ViewOpts::default() });
+        t
+    }
+
+    /// `blank`, its ids from `IdGen::seeded(seed)`: the same base every time (tests, fuzzing).
+    pub fn blank_seeded(now: i64, seed: u64) -> Base {
+        let mut b = Base { ids: IdGen::seeded(seed), ..Default::default() };
+        let t = b.blank_table("未命名数据表", now);
+        b.tables.push(t);
+        b
+    }
+
+    /// A new file's content: one blank table.
+    pub fn blank(now: i64) -> Base { Base::blank_named(now, "未命名数据表", "文本") }
+
+    /// `blank` with the table and its columns named in the interface language.
+    pub fn blank_named(now: i64, name: &str, column: &str) -> Base {
+        let mut b = Base::default();
+        let t = b.blank_table_in(name, column, now);
+        b.tables.push(t);
+        b
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_ids_repeat_and_step_past_what_is_taken() {
+        let a = stable_id(IdKind::Record, ID_LIMIT + 5, 7, 3, |_| false);
+        assert!((1..ID_LIMIT).contains(&a));
+        assert_eq!(stable_id(IdKind::Record, ID_LIMIT + 5, 7, 3, |_| false), a);
+        // each part counts
+        let others = [stable_id(IdKind::Field, ID_LIMIT + 5, 7, 3, |_| false), stable_id(IdKind::Record, 0, 7, 3, |_| false), stable_id(IdKind::Record, ID_LIMIT + 5, 8, 3, |_| false), stable_id(IdKind::Record, ID_LIMIT + 5, 7, 4, |_| false)];
+        assert!(others.iter().all(|o| *o != a) && others.iter().collect::<HashSet<_>>().len() == 4);
+        // taken: the next one up, round past the top to 1
+        if a + 2 < ID_LIMIT { assert_eq!(stable_id(IdKind::Record, ID_LIMIT + 5, 7, 3, |x| x == a || x == a + 1), a + 2); }
+        assert_eq!(free_from(ID_LIMIT - 2, |x| x >= ID_LIMIT - 2 || x == 1), 2);
+        // the values themselves are part of the file format between devices: they mustn't drift
+        assert_eq!(stable_id(IdKind::Table, 0, 0, 0, |_| false), 312_325_106_538_460);
+    }
+
+    #[test]
+    fn unique_keys_find_and_clash() {
+        let mut d = super::super::Doc::new(Base::blank_seeded(0, 3));
+        let t = d.base.tables[0].id;
+        let text = d.base.tables[0].fields[0].id;
+        let num = d.add_field(t, None, "数", FieldType::Number, FieldOpts::default()).unwrap();
+        let pick = d.add_field(t, None, "选", FieldType::SingleSelect, FieldOpts::default()).unwrap();
+        let ids: Vec<RecId> = d.base.tables[0].records.iter().map(|r| r.id).collect();
+        let s = |x: &str| Value::Text(x.into());
+        d.paste(t, &ids, &[text, num, pick], &[
+            vec!["https://x.com/1".into(), "1".into(), "红".into()],
+            vec![" https://x.com/1 ".into(), "1.0".into(), "红".into()],
+            vec!["HTTPS://x.com/1".into(), "2".into(), "蓝".into()],
+            vec!["   ".into(), "".into(), "".into()],
+            vec!["".into(), "-0".into(), "".into()],
+        ]);
+        let tb = &d.base.tables[0];
+        // text: trimmed, then exact (case counts); empty finds nothing
+        assert_eq!(tb.find_unique(text, &s("https://x.com/1")), Some(ids[0]));
+        assert_eq!(tb.find_unique(text, &s("  https://x.com/1\n")), Some(ids[0]));
+        assert_eq!(tb.find_unique(text, &s("HTTPS://x.com/1")), Some(ids[2]));
+        assert_eq!(tb.find_unique(text, &s("https://X.com/1")), None);
+        assert_eq!((tb.find_unique(text, &s("   ")), tb.find_unique(text, &Value::Empty)), (None, None));
+        assert_eq!(tb.duplicates(text), [vec![ids[0], ids[1]]]);
+        // numbers by value: 1 is 1.0, -0 is 0; text that reads as one finds it
+        assert_eq!(tb.find_unique(num, &Value::Number(1.)), Some(ids[0]));
+        assert_eq!(tb.find_unique(num, &s("1.00")), Some(ids[0]));
+        assert_eq!(tb.find_unique(num, &Value::Number(0.)), Some(ids[4]));
+        assert_eq!(tb.find_unique(num, &s("一")), None);
+        assert_eq!(tb.duplicates(num), [vec![ids[0], ids[1]]]);
+        // a 单选 by its option's name
+        let red = tb.field(pick).unwrap().option_named("红").unwrap().id;
+        assert_eq!(tb.find_unique(pick, &Value::Select(vec![red])), Some(ids[0]));
+        assert_eq!(tb.find_unique(pick, &s("蓝")), Some(ids[2]));
+        assert_eq!(tb.duplicates(pick), [vec![ids[0], ids[1]]]);
+        // not a key: nothing found, nothing clashes
+        let made = d.add_field(t, None, "建", FieldType::CreatedTime, FieldOpts::default()).unwrap();
+        assert_eq!((d.base.tables[0].find_unique(made, &Value::Date(0)), d.base.tables[0].duplicates(made).len()), (None, 0));
+    }
+
+    #[test]
+    fn the_unique_mark_is_undone_and_dropped_with_the_type() {
+        let mut d = super::super::Doc::new(Base::blank_seeded(0, 4));
+        let t = d.base.tables[0].id;
+        let f = d.base.tables[0].fields[1].id;
+        let unique = |d: &super::super::Doc| d.base.tables[0].field(f).unwrap().opts.unique;
+        assert!(d.set_unique(t, f, true) && unique(&d));
+        assert!(!d.set_unique(t, f, true));
+        // only `_fields` changes: the table's rows are left alone
+        assert!(d.dirty.meta && d.dirty.schema.is_empty());
+        d.undo();
+        assert!(!unique(&d));
+        d.redo();
+        assert!(unique(&d));
+        // to a type that can't be a key, the mark goes; it doesn't come back with the type
+        let mut g = d.base.tables[0].field(f).unwrap().clone();
+        g.ty = FieldType::Date;
+        assert!(d.change_field(t, g.clone()) && !unique(&d));
+        let mut g = d.base.tables[0].field(f).unwrap().clone();
+        g.ty = FieldType::Text;
+        assert!(d.change_field(t, g) && !unique(&d));
+        let day = d.add_field(t, None, "日", FieldType::Date, FieldOpts { unique: true, ..Default::default() }).unwrap();
+        assert!(!d.set_unique(t, day, true));
+        assert!(!d.base.tables[0].fields.last().unwrap().opts.unique);
+    }
+}

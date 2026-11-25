@@ -1,16 +1,18 @@
 //! 搜索 dialog: a 540-wide white dialog with the input row, 最近浏览 / hit
 //! rows and a gray footer. Locally there is one owner and no sessions or
 //! spaces, so each row's extra line is just 所有者 + the opened / modified
-//! times. Radius 16, quiet row fills, monochrome page glyphs.
+//! times. The design's `Dialog` shell, quiet row fills, monochrome page glyphs.
 
 use crate::app::Workspace;
 use crate::settings::display_title;
 use crate::store::Entry;
+use crate::design::{Button, ButtonSize, Dialog, Separator, scrim};
 use crate::theme::{self, Theme};
-use crate::trash::scrim;
 use crate::ui::{ROW_RADIUS, format_visit, icon, ui_runs, ui_text};
 use gpui::{prelude::FluentBuilder, *};
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 /// How many documents 最近浏览 lists.
 const RECENT: usize = 20;
@@ -21,13 +23,19 @@ const SUMMARY_SEP: &str = "\u{a0}\u{a0}\u{a0}";
 /// Text column of a row: 540 − list padding 6 / 6 (the right one holds the
 /// scrollbar) − row padding 12 / 8 − icon 24 + 10.
 const INFO_W: f32 = 474.;
+/// A hit row without a summary: padding 8 / 8, title 20, extra line 2 + 20.
+const ROW_H: f32 = 58.;
 
 /// Case-insensitive match position in `hay`, in `hay`'s own byte offsets.
 pub(crate) fn find_ci(hay: &str, needle_lower: &str) -> Option<Range<usize>> {
     if needle_lower.is_empty() {
         return None;
     }
-    let lower = hay.to_lowercase();
+    find_folded(hay, &hay.to_lowercase(), needle_lower)
+}
+
+/// [`find_ci`] with `hay.to_lowercase()` already at hand.
+fn find_folded(hay: &str, lower: &str, needle_lower: &str) -> Option<Range<usize>> {
     if lower.len() == hay.len() {
         let i = lower.find(needle_lower)?;
         (hay.is_char_boundary(i) && hay.is_char_boundary(i + needle_lower.len())).then(|| i..i + needle_lower.len())
@@ -51,7 +59,25 @@ fn find_all(hay: &str, q: &str) -> Vec<Range<usize>> {
 /// Body text from the block holding the first match, with about 16
 /// characters of context before it and the following blocks after it.
 pub(crate) fn snippet(body: &str, q: &str) -> Option<(String, Vec<Range<usize>>)> {
-    let m = find_ci(body, q)?;
+    if q.is_empty() {
+        return None;
+    }
+    snippet_folded(body, &body.to_lowercase(), q)
+}
+
+/// [`snippet`] with `body.to_lowercase()` already at hand.
+fn snippet_folded(body: &str, lower: &str, q: &str) -> Option<(String, Vec<Range<usize>>)> {
+    let text = snippet_text(body, lower, q)?;
+    let hits = find_all(&text, q);
+    Some((text, hits))
+}
+
+/// [`snippet_folded`]'s text without the hits.
+fn snippet_text(body: &str, lower: &str, q: &str) -> Option<String> {
+    if q.is_empty() {
+        return None;
+    }
+    let m = find_folded(body, lower, q)?;
     let line_start = body[..m.start].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let before: Vec<(usize, char)> = body[line_start..m.start].char_indices().collect();
     let cut = if before.len() > 16 { line_start + before[before.len() - 16].0 } else { line_start };
@@ -72,24 +98,14 @@ pub(crate) fn snippet(body: &str, q: &str) -> Option<(String, Vec<Range<usize>>)
             break;
         }
     }
-    let hits = find_all(&text, q);
-    Some((text, hits))
+    Some(text)
 }
 
 /// The summary as two lines at most, ending in "…" when cut. GPUI's own
 /// `line_clamp` truncates at twice the width, ignoring wrap leftovers.
 pub(crate) fn summary_text(text: String, mut hits: Vec<Range<usize>>, width: f32, window: &Window) -> StyledText {
-    let mut style = window.text_style();
-    style.font_family = theme::UI_FONT.into();
-    style.font_size = px(12.).into();
-    style.color = Theme::text_caption();
-    let lines = |s: &str| {
-        window
-            .text_system()
-            .shape_text(s.to_string().into(), px(12.), &ui_runs(s, &style, &[], style.color), Some(px(width)), None)
-            .map(|ls| ls.iter().map(|l| l.wrap_boundaries().len() + 1).sum::<usize>())
-            .unwrap_or(1)
-    };
+    let style = summary_style(window);
+    let lines = |s: &str| summary_lines(s, &style, &[], width, window);
     let text = if lines(&text) <= 2 {
         text
     } else {
@@ -103,14 +119,150 @@ pub(crate) fn summary_text(text: String, mut hits: Vec<Range<usize>>, width: f32
         hits.retain(|r| r.end <= cut);
         format!("{}…", &text[..cut])
     };
-    let runs = ui_runs(&text, &style, &hits, Theme::link());
+    let runs = ui_runs(&text, &style, &hits, crate::design::color::foreground());
     StyledText::new(text).with_runs(runs)
 }
+
+fn summary_style(window: &Window) -> TextStyle {
+    let mut style = window.text_style();
+    style.font_family = theme::ui_family().into();
+    style.font_size = px(12.).into();
+    style.color = Theme::text_caption();
+    style
+}
+
+/// How many lines `s`, with `hits` in the link colour, wraps to in a summary `width` wide.
+fn summary_lines(s: &str, style: &TextStyle, hits: &[Range<usize>], width: f32, window: &Window) -> usize {
+    window
+        .text_system()
+        .shape_text(s.to_string().into(), px(12.), &ui_runs(s, style, hits, crate::design::color::foreground()), Some(px(width)), None)
+        .map(|ls| ls.iter().map(|l| l.wrap_boundaries().len() + 1).sum::<usize>())
+        .unwrap_or(1)
+}
+
+/// A library document's title and body, lowercased once (`None` when that
+/// changes nothing): lowercasing all of them on every keystroke, several
+/// times a frame, made typing in 搜索 lag on big libraries (#332).
+struct Folded {
+    id: String,
+    title: String,
+    body: Arc<str>,
+    title_l: Option<String>,
+    body_l: Option<Box<str>>,
+}
+
+impl Folded {
+    fn new(e: &Entry) -> Self {
+        let title_l = e.title.to_lowercase();
+        let body_l = e.body.to_lowercase();
+        Folded {
+            id: e.id.clone(),
+            title: e.title.clone(),
+            body: e.body.clone(),
+            title_l: (title_l != e.title).then_some(title_l),
+            body_l: (*body_l != *e.body).then(|| body_l.into()),
+        }
+    }
+    fn title_l(&self) -> &str { self.title_l.as_deref().unwrap_or(&self.title) }
+    fn body_l(&self) -> &str { self.body_l.as_deref().unwrap_or(&self.body) }
+    /// Still describes `e`'s text.
+    fn holds(&self, e: &Entry) -> bool {
+        self.id == e.id && self.title == e.title && (Arc::ptr_eq(&self.body, &e.body) || self.body == e.body)
+    }
+}
+
+/// The search index: [`Folded`] copies aligned with `Workspace::entries`,
+/// checked against them on each use (they are replaced in many places), and
+/// the last query's hits with their row heights.
+#[derive(Default)]
+pub(crate) struct SearchCache {
+    docs: Vec<Folded>,
+    /// Bumped whenever `docs` changes; older hits are stale.
+    generation: u64,
+    hits: Option<Hits>,
+    /// Advances of printable ASCII in the summary font (界面字体), for [`min_width`].
+    ascii: Option<(&'static str, [f32; 128])>,
+}
+
+struct Hits {
+    generation: u64,
+    q: String,
+    /// Indices into the entries: title hits, then body hits, each in list order.
+    rows: Vec<usize>,
+    /// Each row's height in the 界面字体 it was measured in on first render.
+    heights: Option<(&'static str, Vec<f32>)>,
+}
+
+impl SearchCache {
+    fn sync(&mut self, entries: &[Entry]) {
+        if self.docs.len() == entries.len() && self.docs.iter().zip(entries).all(|(d, e)| d.holds(e)) {
+            // Same text in a new allocation: keep the new one so the next check is a pointer compare.
+            for (d, e) in self.docs.iter_mut().zip(entries) { d.body = e.body.clone(); }
+            return;
+        }
+        let mut old: HashMap<String, Folded> = std::mem::take(&mut self.docs).into_iter().map(|d| (d.id.clone(), d)).collect();
+        self.docs = entries
+            .iter()
+            .map(|e| match old.remove(&e.id) {
+                Some(d) if d.holds(e) => Folded { body: e.body.clone(), ..d },
+                _ => Folded::new(e),
+            })
+            .collect();
+        self.generation += 1;
+    }
+
+    /// The hits for `q` (lowercase, not empty) among `entries`.
+    fn rows(&mut self, entries: &[Entry], q: &str) -> &mut Hits {
+        self.sync(entries);
+        if !matches!(&self.hits, Some(h) if h.generation == self.generation && h.q == q) {
+            let (mut rows, mut body) = (vec![], vec![]);
+            for (i, d) in self.docs.iter().enumerate() {
+                // A folder with a 正文 is found as that document (#357), not twice.
+                if entries[i].note.is_some() { continue; }
+                if d.title_l().contains(q) {
+                    rows.push(i)
+                } else if d.body_l().contains(q) {
+                    body.push(i)
+                }
+            }
+            rows.extend(body);
+            self.hits = Some(Hits { generation: self.generation, q: q.into(), rows, heights: None });
+        }
+        self.hits.as_mut().unwrap()
+    }
+}
+
+/// A lower bound for the summary width of `s`: ASCII at 90% of its advance
+/// (cached in `ascii`), CJK ideographs, kana and Hangul at 80% of the em,
+/// the rest 0.
+fn min_width(ascii: &mut Option<(&'static str, [f32; 128])>, s: &str, style: &TextStyle, window: &Window) -> f32 {
+    let family = theme::ui_family();
+    if ascii.as_ref().is_none_or(|(f, _)| *f != family) {
+        let ts = window.text_system();
+        let font = ts.resolve_font(&style.font());
+        *ascii = Some((family, std::array::from_fn(|c| match c as u8 {
+            b' '..=b'~' => ts.advance(font, px(12.), c as u8 as char).map(|s| f32::from(s.width)).unwrap_or(0.),
+            _ => 0.,
+        })));
+    }
+    let adv = &ascii.as_ref().unwrap().1;
+    s.chars()
+        .map(|c| match c as u32 {
+            c @ 0..128 => adv[c as usize] * 0.9,
+            0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xac00..=0xd7a3 => 12. * 0.8,
+            _ => 0.,
+        })
+        .sum()
+}
+
+/// `e` is a result for `q` through its body, not its title (see `SearchCache::rows`).
+fn body_hit(e: &Entry, q: &str) -> bool { !q.is_empty() && !e.title.to_lowercase().contains(q) }
 
 /// The glyph of a file titled by its name: Markdown, a 画板; else a page.
 pub(crate) fn file_glyph(m: &crate::store::Meta) -> &'static str {
     match m.kind {
-        crate::store::DocKind::Board => "whiteboard",
+        crate::store::DocKind::Board => "board",
+        crate::store::DocKind::Table => "doc-table",
         _ if m.markdown => "doc-md",
         _ => "doc",
     }
@@ -141,21 +293,6 @@ pub(crate) fn doc_icon_named(name: &str) -> Div {
         .child(icon(name, 18., Theme::icon()))
 }
 
-/// The 24px square buttons at the right of the input row.
-fn input_button(id: &'static str, glyph: &'static str, size: f32, color: Hsla) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex_none()
-        .size(px(24.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(ROW_RADIUS))
-        .cursor_pointer()
-        .hover(|s| s.bg(Theme::fill_hover()))
-        .child(icon(glyph, size, color))
-}
-
 /// One `·`-separated part of a row's extra line.
 fn extra_segment(glyph: Option<&'static str>, text: String) -> Div {
     div()
@@ -172,10 +309,13 @@ pub(crate) fn extra_line(e: &Entry) -> Div {
     if e.meta.opened > 0 {
         extra.push(extra_segment(Some("eye"), crate::localized_format!("你在 {}打开过", "Opened {}", format_visit(e.meta.opened))));
     }
-    extra.push(extra_segment(Some("pen-line"), crate::localized_format!("我在 {}修改过", "Modified {}", format_visit(e.meta.modified))));
+    // a row with no modified time (a folder never written) says nothing rather than 1970
+    if e.meta.modified > 0 {
+        extra.push(extra_segment(Some("pen-line"), crate::localized_format!("我在 {}修改过", "Modified {}", format_visit(e.meta.modified))));
+    }
     let last = extra.len() - 1;
     let extra = extra.into_iter().enumerate().flat_map(|(i, seg)| {
-        let seg = if i == last { seg.flex_shrink().min_w_0().overflow_hidden() } else { seg };
+        let seg = if i == last { seg.flex_shrink_1().min_w_0().overflow_hidden() } else { seg };
         [(i > 0).then(|| div().flex_none().child(" · ")), Some(seg)].into_iter().flatten()
     });
     div()
@@ -211,7 +351,7 @@ pub(crate) fn result_info(e: &Entry, q: &str, summary: Option<(String, Vec<Range
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
-                .child(ui_text(title).hit(title_hit, Theme::link())),
+                .child(ui_text(title).hit(title_hit, crate::design::color::foreground())),
         )
         .children(summary.map(|(text, hits)| div().text_size(px(12.)).line_height(px(20.)).child(summary_text(text, hits, width, window))))
         .child(extra_line(e))
@@ -219,6 +359,7 @@ pub(crate) fn result_info(e: &Entry, q: &str, summary: Option<(String, Vec<Range
 
 impl Workspace {
     pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.still_loading(cx) { return }
         self.search_open = true;
         self.search_sel = Some(0);
         self.row_menu = None;
@@ -231,7 +372,7 @@ impl Workspace {
             s.line_height = 22.;
             s.set_text("", cx)
         });
-        window.focus(&search.focus_handle(cx));
+        window.focus(&search.focus_handle(cx), cx);
         self.search_scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
     }
@@ -242,7 +383,7 @@ impl Workspace {
         }
         self.search_open = false;
         if let Some(ed) = &self.editor {
-            ed.read(cx).focus(window);
+            { let f = ed.read(cx).focus.clone(); window.focus(&f, cx); }
         }
         cx.notify();
     }
@@ -253,11 +394,17 @@ impl Workspace {
     }
 
     pub(crate) fn pick_search(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.search_results(cx).get(row).map(|e| e.id.clone()) else { return };
+        let q = self.query(cx);
+        let Some((id, body_hit)) = self.search_results(cx).get(row).map(|e| (e.id.clone(), body_hit(e, &q))) else { return };
         self.close_search(window, cx);
         self.open(&id, window, cx);
         if let Some(ed) = &self.editor {
-            ed.read(cx).focus(window);
+            // Found in the body: open at that hit, selected (#64). A title hit
+            // opens where the document was left, as before.
+            if body_hit && self.current.as_deref() == Some(id.as_str()) {
+                ed.update(cx, |e, cx| e.reveal_body_hit(&q, window, cx));
+            }
+            { let f = ed.read(cx).focus.clone(); window.focus(&f, cx); }
         }
     }
 
@@ -277,32 +424,58 @@ impl Workspace {
 
     /// Title hits first, then body hits; with no query, 最近浏览.
     pub fn search_results(&self, cx: &App) -> Vec<&Entry> {
-        let q = self.query(cx);
+        self.search_rows(&self.query(cx)).into_iter().map(|i| &self.entries[i]).collect()
+    }
+
+    /// [`Self::search_results`] as indices into `entries`.
+    fn search_rows(&self, q: &str) -> Vec<usize> {
         if q.is_empty() {
-            let mut recent: Vec<&Entry> = self.entries.iter().collect();
-            recent.sort_by_key(|e| std::cmp::Reverse(e.meta.opened.max(e.meta.modified)));
+            // An attachment opened in its own window belongs to its page, not to 最近浏览.
+            let mut recent: Vec<usize> = (0..self.entries.len()).filter(|&i| self.entries[i].note.is_none() && !self.entries[i].meta.attachment()).collect();
+            recent.sort_by_key(|&i| std::cmp::Reverse(self.entries[i].meta.opened.max(self.entries[i].meta.modified)));
             recent.truncate(RECENT);
             return recent;
         }
-        let mut hits: Vec<(u8, &Entry)> = self
-            .entries
-            .iter()
-            .filter_map(|e| {
-                if e.title.to_lowercase().contains(&q) {
-                    Some((0, e))
-                } else if e.body.to_lowercase().contains(&q) {
-                    Some((1, e))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        hits.sort_by_key(|(rank, _)| *rank);
-        hits.into_iter().map(|(_, e)| e).collect()
+        self.search_cache.borrow_mut().rows(&self.entries, q).rows.clone()
     }
 
-    fn search_row(&self, e: &Entry, ix: usize, q: &str, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let summary = snippet(&e.body, q);
+    /// Each hit row's height for `q` (not empty): the summary's line count
+    /// decides it, so only rows near the view need building.
+    fn search_heights(&self, q: &str, window: &Window) -> Vec<f32> {
+        let mut cache = self.search_cache.borrow_mut();
+        let cache = &mut *cache;
+        if let Some((font, h)) = &cache.rows(&self.entries, q).heights && *font == theme::ui_family() {
+            return h.clone();
+        }
+        let SearchCache { docs, hits, ascii, .. } = cache;
+        let hits = hits.as_mut().unwrap();
+        let style = summary_style(window);
+        let mut heights = Vec::with_capacity(hits.rows.len());
+        for &i in &hits.rows {
+            let d = &docs[i];
+            heights.push(match snippet_text(&d.body, d.body_l(), q) {
+                None => ROW_H,
+                // Clearly wider than a line: two lines, cut by `summary_text` if longer.
+                Some(text) if min_width(ascii, &text, &style, window) > INFO_W + 12. => ROW_H + 40.,
+                // Else shaped as `summary_text` and the row will.
+                Some(text) if summary_lines(&text, &style, &[], INFO_W, window) > 2 => ROW_H + 40.,
+                Some(text) => {
+                    let hits = find_all(&text, q);
+                    ROW_H + 20. * summary_lines(&text, &style, &hits, INFO_W, window) as f32
+                }
+            });
+        }
+        hits.heights = Some((theme::ui_family(), heights.clone()));
+        heights
+    }
+
+    /// Result `ix`, the entry at `i`.
+    fn search_row(&self, i: usize, ix: usize, q: &str, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let e = &self.entries[i];
+        let summary = match self.search_cache.borrow().docs.get(i) {
+            Some(d) if d.holds(e) => snippet_folded(&d.body, d.body_l(), q),
+            _ => snippet(&e.body, q),
+        };
         // Result indices match keyboard selection.
         let row = ix;
         div()
@@ -334,8 +507,9 @@ impl Workspace {
         }
         let q = self.query(cx);
         let has_text = !self.search.read(cx).text.is_empty();
-        let results: Vec<Entry> = self.search_results(cx).into_iter().cloned().collect();
+        let results = self.search_rows(&q);
         let vh = f32::from(window.viewport_size().height);
+        let dialog_h = 630f32.min(vh - 120.).max(200.);
 
         let input = div()
             .flex_none()
@@ -356,10 +530,10 @@ impl Workspace {
             )
             .child(div().flex_1().min_w_0().pl(px(2.)).flex().child(self.search.clone()))
             .when(has_text, |d| {
-                d.child(input_button("search-clear", "search-clear", 18., Theme::text_disabled()).ml(px(8.)).on_click(cx.listener(
+                d.child(Button::ghost("search-clear").icon("search-clear").sized(ButtonSize::Xs).ml(px(8.)).on_click(cx.listener(
                     |w, _, window, cx| {
                         w.search.update(cx, |s, cx| s.set_text("", cx));
-                        window.focus(&w.search.focus_handle(cx));
+                        window.focus(&w.search.focus_handle(cx), cx);
                         w.search_sel = Some(0);
                         w.search_scroll.set_offset(point(px(0.), px(0.)));
                         cx.notify();
@@ -378,6 +552,8 @@ impl Workspace {
             .flex_col()
             .overflow_y_scroll()
             .track_scroll(&self.search_scroll);
+        // the rows keep 6 from the side: while the list scrolls, the scrollbar's lane beside them
+        list = self.home.search_scrollbar.make_room(list, 6.);
         if q.is_empty() && !results.is_empty() {
             list = list.child(
                 div()
@@ -405,8 +581,33 @@ impl Workspace {
                     .child(crate::settings::text("没有找到匹配的结果，尝试其他关键词进行搜索")),
             );
         }
-        for (i, e) in results.iter().enumerate() {
-            list = list.child(self.search_row(e, i, &q, window, cx));
+        if q.is_empty() {
+            for (ix, &i) in results.iter().enumerate() {
+                list = list.child(self.search_row(i, ix, &q, window, cx));
+            }
+        } else {
+            // Hits can number thousands: rows away from the view and the
+            // selection (which a keyboard move scrolls to this frame) are
+            // spacers of the row's height, so the scrollbar and scroll
+            // positions stay the same.
+            let heights = self.search_heights(&q, window);
+            let view = dialog_h - 46. - 1. - 36.;
+            let top = -f32::from(self.search_scroll.offset().y);
+            let (mut y, mut sel) = (4., None);
+            if let Some(s) = self.search_sel.filter(|&s| s < heights.len()) {
+                let (y0, y1) = (4. + heights[..s].iter().sum::<f32>(), 4. + heights[..=s].iter().sum::<f32>());
+                // Off screen, it is scrolled to the top or bottom edge.
+                if y0 < top || y1 > top + view { sel = Some((y0 - view, y1 + view)) }
+            }
+            for (ix, (&i, &h)) in results.iter().zip(&heights).enumerate() {
+                let near = |(a, b): (f32, f32)| y + h > a && y < b;
+                list = if near((top - 100., top + view + 100.)) || sel.is_some_and(near) {
+                    list.child(self.search_row(i, ix, &q, window, cx).into_any_element())
+                } else {
+                    list.child(div().flex_none().h(px(h)).into_any_element())
+                };
+                y += h;
+            }
         }
 
         let footer = div()
@@ -417,7 +618,7 @@ impl Workspace {
             .flex()
             .items_center()
             // GPUI clips children to the dialog's rect, not its rounded corners.
-            .rounded_b(px(16.))
+            .rounded_b(px(crate::design::geo().dialog_r))
             .border_t_1()
             .border_color(Theme::line_divider())
             .bg(Theme::bg_overlay())
@@ -428,34 +629,23 @@ impl Workspace {
             .overflow_hidden()
             .child(ui_text(crate::settings::tr("支持 ↑↓ 键选择、Enter 键打开", "Use ↑↓ to select, Enter to open")));
 
-        let modal = div()
-            .id("search-dialog")
-            .occlude()
+        // The dialog's shell only: the input row, list and footer run edge to edge.
+        let modal = Dialog::new("search-dialog")
             .w(px(540.))
-            .h(px(630f32.min(vh - 120.).max(200.)))
-            .flex()
-            .flex_col()
-            .rounded(px(16.))
-            .bg(crate::theme::raised(Theme::bg_body()))
-            .shadow(theme::shadow_dialog())
+            .h(px(dialog_h))
+            .p_0()
+            .gap_0()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(input)
-            .child(div().flex_none().h(px(1.)).bg(Theme::line_divider()))
-            // The thumb sits in the list's right padding, over no row.
+            .child(Separator::new())
+            // The thumb sits in the list's right padding (`make_room`), over no row.
             .child(div().flex_1().min_h_0().relative().flex().flex_col().child(list).child(self.home.search_scrollbar.render(&self.search_scroll)))
             .child(footer);
 
         Some(
             deferred(
-                div()
+                scrim()
                     .id("search-mask")
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .bg(scrim())
                     .on_mouse_down(MouseButton::Left, cx.listener(|w, _, window, cx| w.close_search(window, cx)))
                     .child(modal),
             )
@@ -467,7 +657,78 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::snippet;
+    use super::{SearchCache, body_hit, snippet};
+    use crate::store::Entry;
+
+    fn entry(id: &str, title: &str, body: &str) -> Entry {
+        Entry { id: id.into(), meta: Default::default(), title: title.into(), icon: None, body: body.into(), reminders: vec![], links: vec![], note: None, top: String::new() }
+    }
+
+    /// The pre-#332 ranking: lowercase each title, then each body.
+    fn reference(entries: &[Entry], q: &str) -> Vec<usize> {
+        let mut hits: Vec<(u8, usize)> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                if e.title.to_lowercase().contains(q) { Some((0, i)) } else if e.body.to_lowercase().contains(q) { Some((1, i)) } else { None }
+            })
+            .collect();
+        hits.sort_by_key(|(rank, _)| *rank);
+        hits.into_iter().map(|(_, i)| i).collect()
+    }
+
+    #[test]
+    fn hits_rank_titles_first_in_list_order() {
+        let entries = vec![
+            entry("a", "Notes", "the Apple pie"),
+            entry("b", "APPLE harvest", ""),
+            entry("c", "Ärger", "ÄPFEL und apple"),
+            entry("d", "plain", "nothing"),
+            entry("e", "Apple again", "apple"),
+            entry("f", "苹果", "Apple 苹果"),
+        ];
+        let mut cache = SearchCache::default();
+        for q in ["apple", "äp", "ä", "苹果", "e", "zzz"] {
+            assert_eq!(cache.rows(&entries, q).rows, reference(&entries, q), "{q}");
+        }
+        assert_eq!(cache.rows(&entries, "apple").rows, [1, 4, 0, 2, 5]);
+    }
+
+    #[test]
+    fn hits_follow_library_changes() {
+        let mut entries = vec![entry("a", "One", "alpha"), entry("b", "Two", "beta")];
+        let mut cache = SearchCache::default();
+        assert_eq!(cache.rows(&entries, "beta").rows, [1]);
+        cache.rows(&entries, "beta").heights = Some(("", vec![58.]));
+        let generation = cache.generation;
+        // The same text in new allocations (a fresh `Store::list`) keeps the hits.
+        let fresh: Vec<Entry> = entries.iter().map(|e| entry(&e.id, &e.title, e.body.as_ref())).collect();
+        assert!(cache.rows(&fresh, "beta").heights.is_some());
+        assert_eq!(cache.generation, generation);
+        // An edited body, a renamed title, an added and a removed document each drop them.
+        entries[0].body = "alpha beta".into();
+        assert_eq!(cache.rows(&entries, "beta").rows, [0, 1]);
+        assert!(cache.rows(&entries, "beta").heights.is_none());
+        entries[1].title = "Beta".into();
+        assert_eq!(cache.rows(&entries, "beta").rows, [1, 0]);
+        entries.insert(0, entry("c", "Gamma", "BETA"));
+        assert_eq!(cache.rows(&entries, "beta").rows, [2, 0, 1]);
+        entries.remove(2);
+        assert_eq!(cache.rows(&entries, "beta").rows, [0, 1]);
+        assert_eq!(cache.rows(&entries, "gamma").rows, [0]);
+        // Reordered (sorted by modification) entries map to their new places.
+        entries.reverse();
+        assert_eq!(cache.rows(&entries, "gamma").rows, [1]);
+        assert_eq!(cache.rows(&[], "gamma").rows, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn body_hits_open_at_the_hit() {
+        // `rows` puts a document whose title holds the query with the title hits.
+        assert!(!body_hit(&entry("a", "APPLE harvest", "apple"), "apple"));
+        assert!(body_hit(&entry("b", "Notes", "the Apple pie"), "apple"));
+        assert!(!body_hit(&entry("c", "Notes", "x"), ""));
+    }
 
     #[test]
     fn snippet_context() {

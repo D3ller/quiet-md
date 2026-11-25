@@ -17,13 +17,19 @@ impl BlockId {
     }
 }
 
-/// What a document with an empty title is called.
+/// What a document with an empty title is called; the key its translations go by.
 pub const UNTITLED: &str = "未命名文档";
+static UNTITLED_NAME: std::sync::RwLock<&'static str> = std::sync::RwLock::new(UNTITLED);
+
+/// `UNTITLED` in the interface's language, for file names and exports too (#271).
+pub fn untitled() -> &'static str { *UNTITLED_NAME.read().unwrap_or_else(|e| e.into_inner()) }
+/// Set by the app when its language is chosen.
+pub fn set_untitled(name: &'static str) { *UNTITLED_NAME.write().unwrap_or_else(|e| e.into_inner()) = name; }
 
 /// A document title as shown in lists and links.
 pub fn display_title(t: &str) -> String {
     let t = t.trim();
-    if t.is_empty() { UNTITLED.to_string() } else { t.to_string() }
+    if t.is_empty() { untitled().to_string() } else { t.to_string() }
 }
 
 /// Named palette color as used by DocxXML (`red`, `light-blue`, `medium-gray`, ...).
@@ -721,7 +727,9 @@ pub enum BlockKind {
     Bullet,
     Ordered { seq: Option<u32> },
     Todo { done: bool },
-    Code { lang: String, caption: Option<String>, wrap: bool },
+    /// `show_code`: a Mermaid block shows its source instead of the diagram
+    /// (`view="code"`; the diagram is the default, see src/mermaid.rs).
+    Code { lang: String, caption: Option<String>, wrap: bool, show_code: bool },
     Quote,
     Callout {
         emoji: String,
@@ -756,6 +764,9 @@ pub enum BlockKind {
     /// 画板 (`<whiteboard type="excalidraw">`): an Excalidraw scene, shared
     /// between undo snapshots until it changes.
     Board(std::sync::Arc<crate::whiteboard::Board>),
+    /// 数据表 (`<datatable src=…/>`): a view onto a `.sqlite` file; the data
+    /// lives in the file, the page only says which one.
+    DataTable(crate::table::TableRef),
     /// Any element we don't model; kept verbatim for round-tripping.
     Raw { tag: String, xml: String },
 }
@@ -1050,6 +1061,37 @@ impl Document {
         walk(&self.blocks, &mut f);
     }
 
+    /// Every link (`[text](url)`), in order, tables' cells included.
+    pub fn links(&self) -> Vec<String> {
+        let mut out = vec![];
+        self.for_each_block(|b| out.extend(b.text.runs.iter().filter_map(|r| r.marks.link.clone())));
+        out
+    }
+
+    /// Change links: `f` gives the new URL of one it changes. Whether any changed.
+    pub fn map_links(&mut self, f: &mut dyn FnMut(&str) -> Option<String>) -> bool {
+        fn walk(blocks: &mut [Block], f: &mut dyn FnMut(&str) -> Option<String>, changed: &mut bool) {
+            for b in blocks {
+                if b.text.runs.iter().any(|r| r.marks.link.is_some()) {
+                    let mut out = RichText::default();
+                    for (r, m) in b.text.spans() {
+                        let mut m = m.clone();
+                        if let Some(new) = m.link.as_deref().and_then(&mut *f) { m.link = Some(new); *changed = true; }
+                        out.push(&b.text.text[r], m);
+                    }
+                    b.text = out;
+                }
+                walk(&mut b.children, f, changed);
+                if let BlockKind::Table(t) = &mut b.kind {
+                    for row in &mut t.rows { for cell in row { walk(&mut cell.blocks, f, changed); } }
+                }
+            }
+        }
+        let mut changed = false;
+        walk(&mut self.blocks, f, &mut changed);
+        changed
+    }
+
     /// The 日期提醒 in the document.
     pub fn reminders(&self) -> Vec<InlineReminder> {
         let mut out = vec![];
@@ -1079,6 +1121,34 @@ impl Document {
             }
         });
         out
+    }
+
+    /// Each source a page keeps a file by (images, attachments as blocks and
+    /// inline, the cover) handed to `f`, which gives the one to keep instead or
+    /// None to leave it. An inline file's element keeps its other attributes.
+    pub fn map_sources(&mut self, mut f: impl FnMut(&str) -> Option<String>) {
+        fn walk(blocks: &mut [Block], f: &mut dyn FnMut(&str) -> Option<String>) {
+            for b in blocks {
+                match &mut b.kind {
+                    BlockKind::Image { src, .. } => if let Some(new) = f(src) { *src = new },
+                    BlockKind::File(file) if file.src_kind == "path" => if let Some(new) = f(&file.src) { file.src = new },
+                    BlockKind::Table(t) => for cell in t.rows.iter_mut().flatten() { walk(&mut cell.blocks, f) },
+                    _ => {}
+                }
+                for r in &mut b.text.runs {
+                    let Some(inline) = r.marks.inline.as_mut() else { continue };
+                    let InlineKind::File(file) = &mut inline.kind else { continue };
+                    if file.src_kind != "path" { continue }
+                    let Some(new) = f(&file.src) else { continue };
+                    let attr = |s: &str| format!("path=\"{}\"", crate::docxml::esc_attr(s));
+                    inline.xml = inline.xml.replacen(&attr(&file.src), &attr(&new), 1);
+                    file.src = new;
+                }
+                walk(&mut b.children, f);
+            }
+        }
+        if let Some(c) = self.cover.as_mut() && let Some(new) = f(&c.src) { c.src = new }
+        walk(&mut self.blocks, &mut f);
     }
 
     /// Sources of the images and attachments (blocks and inline files).

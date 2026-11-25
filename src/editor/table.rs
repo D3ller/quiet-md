@@ -13,10 +13,14 @@ use gpui::{prelude::FluentBuilder, *};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// Width of the row bar / height of the column bar.
 const BAR: f32 = 10.;
+/// How far into a cell from its left border a press selects the cell: its
+/// left padding (8 in the Feishu style, 10 otherwise), so never on text.
+const CELL_EDGE: f32 = 8.;
 /// Outer corner radius of the cell grid.
 /// `top: 26px` for the pinned header row.
 const STICKY_TOP: f32 = 26.;
@@ -110,6 +114,28 @@ impl Editor {
         Some((find(false, p.y)?, find(true, p.x)?))
     }
 
+    /// The cell whose left edge is under `p`, from the cell holding block
+    /// `id` outwards (a table inside a cell is checked before the outer one):
+    /// a press within `CELL_EDGE` of a cell's left border, in its padding,
+    /// selects that one cell, as in Feishu. The column resizer keeps the
+    /// border's own 3px.
+    pub(super) fn cell_edge_at(&self, id: BlockId, p: Point<Pixels>) -> Option<CellSel> {
+        let mut at = self.core.cell_of(id);
+        while let Some((table, _, _)) = at {
+            if let Some((r, c)) = self.slot_at(table, p, false)
+                && let Some(t) = self.core.table(table)
+            {
+                let (r, c) = t.origin(r, c);
+                let left = self.tables.geo.borrow().get(&(table, true, c)).map(|b| b.left());
+                if left.is_some_and(|l| p.x >= l && p.x < l + px(CELL_EDGE)) {
+                    return Some(CellSel { table, anchor: (r, c), head: (r, c), kind: CellSelKind::Range });
+                }
+            }
+            at = self.core.cell_of(table);
+        }
+        None
+    }
+
     /// A text drag that reaches another cell of its table selects cells
     /// instead; back in the first cell it is a text selection again. True
     /// while cells are selected.
@@ -141,7 +167,7 @@ impl Editor {
     /// extends) and follow the pointer along the bar. On an already selected
     /// segment it picks the selected lines up to move them instead.
     fn bar_down(&mut self, table: BlockId, cols: bool, i: usize, p: Point<Pixels>, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         self.menu = None;
         self.slash = None;
         self.toolbar_hidden = false;
@@ -344,7 +370,7 @@ impl Editor {
         self.core.block_sel = None;
         self.core.table_insert(table, cols, at);
         self.tables.insert = None;
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         self.changed(window, cx);
     }
 }
@@ -408,13 +434,6 @@ struct Sticky {
     child: AnyElement,
     st: Rc<StickyState>,
     lead: Option<(BlockId, Stuck)>,
-}
-
-impl IntoElement for Sticky {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
 }
 
 impl Element for Sticky {
@@ -781,7 +800,9 @@ impl R<'_> {
             let (top, bottom) = (t.top().max(b.top()), t.bottom().min(b.bottom()));
             if bottom <= top { return }
             let h = bottom - top;
-            let shade = |deg| linear_gradient(deg, linear_color_stop(theme::rgbaf(0, 0, 0, 0.05), 0.), linear_color_stop(theme::rgbaf(0, 0, 0, 0.), 1.));
+            // the edge shade deepens in the dark, as the other shadows do (5% black is lost on the dark page)
+            let edge = if crate::theme::dark() { 0.35 } else { 0.05 };
+            let shade = |deg| linear_gradient(deg, linear_color_stop(theme::rgbaf(0, 0, 0, edge), 0.), linear_color_stop(theme::rgbaf(0, 0, 0, 0.), 1.));
             if t.left() < b.left() - px(0.5) {
                 window.paint_quad(fill(Bounds::new(point(b.left() + px(1.), top), size(px(10.), h)), shade(90.)));
                 window.paint_quad(fill(Bounds::new(point(b.left(), top), size(px(1.), h)), Theme::table_line()));

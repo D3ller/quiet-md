@@ -3,14 +3,27 @@
 //! (default /tmp). One step per line:
 //!   wait <ms> | key <keystroke> | type <text> | move x y | click x y |
 //!   dclick x y | rclick x y | drag x1 y1 x2 y2 | shot <name> | burst <name> n |
+//!   mods shift|cmd|alt|ctrl… (held for the mouse steps after it; `mods none` lets go) |
 //!   mark <text> (IME composition) | commit <text> | nkey <letter> (a real
 //!   key press through AppKit, so the active input method sees it) |
 //!   activate (make the window key; takes focus) | quit |
 //!   pick <path>[|<path>...] (answers the next file dialog instead of showing it)
+//!   row <title> | rrow <title> | hoverrow <title> (click, right-click or hover the sidebar row
+//!   with that title: 主页, 我的文档, a document or folder, 设置, a page in 设置's list…, or
+//!   the menu item (`design::MenuItem`: the + menu's 画板, a board's right-click menu); the
+//!   topmost if several; no row shown by that title ends the run with exit code 3) |
+//!   anchor <name> (click the middle of a tracked control, e.g. `create-sidebar`: 我的文档's "+",
+//!   `doc-font-picker` / `ui-font-picker`: 外观's font lists, `font-del-<id>`: a downloaded font's delete) |
+//!   window <n> (the steps after it play in the n-th window, 0 the main one, in the order they opened) |
+//!   windows <n> (that many windows are open; else the run ends with exit code 3) |
+//!   showing <title> (the document or folder page in front has that title; else the run ends with exit code 3) |
+//!   origin board | origin window (the points of the mouse and file steps after it count from the open
+//!   画板's top-left corner, or again from the window's; no board open ends the run with exit code 3)
 //!   filedrag x y <path>[|<path>...] / filedrop x y / fileleave (files dragged in from the Finder)
 //! For profiling: bench <n> <step> (runs the step n times, drawing a frame
 //!   synchronously after each, and prints step / frame / editor-render times) |
 //!   wheel x y dy [dx] (one scroll-wheel event; dx: sideways component).
+//!   pinch x y delta (one trackpad pinch event; delta 0.1 zooms in 10%).
 //! For demo videos: glide x y ms (eased pointer move from the last position) |
 //!   scroll x y dy ms (eased wheel scroll) | record <file.mp4> | record stop |
 //!   caption <text> (a timed note in the pointer track, for titles).
@@ -18,16 +31,20 @@
 //!   they have no cursor, traffic lights or rounded corners; the pointer track
 //!   goes to `<file>.cursor` for compositing those in afterwards.
 
+mod priority;
+mod board_reload;
+
 use gpui::*;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 fn fps() -> f64 {
     std::env::var("FDL_RECORD_FPS").ok().and_then(|v| v.parse().ok()).filter(|&f: &f64| f > 0.).unwrap_or(30.)
 }
 
 /// A script drives this run: other apps, dialogs and the updater stay out of it.
-pub fn scripted() -> bool { std::env::var_os("FDL_SCRIPT").is_some() }
+pub fn scripted() -> bool { std::env::var_os("FDL_SCRIPT").is_some() || crate::selftest::active() }
 
 /// Time spent in the editor's `render` during the last benched frame.
 pub static RENDER_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -41,6 +58,10 @@ static PICK: Mutex<Option<Vec<std::path::PathBuf>>> = Mutex::new(None);
 static BENCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Where the scripted drag is (`down`, `dragto`, `dragby`).
 static DRAG_AT: Mutex<(f32, f32)> = Mutex::new((0., 0.));
+/// Where the points of later steps count from (`origin board`), in window coordinates.
+static ORIGIN: Mutex<(f32, f32)> = Mutex::new((0., 0.));
+/// Modifier keys held for the mouse steps that follow (`mods shift cmd` / `mods none`), as NSEvent flags.
+static MODS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The scripted answer to the next open / save dialog, if any.
 /// Files a script is dragging over the window (`filedrag`), as the Finder would.
@@ -65,6 +86,11 @@ fn ease(t: f32) -> f32 {
 }
 
 thread_local! { static CURRENT: std::cell::Cell<Option<(AnyWindowHandle, usize)>> = const { std::cell::Cell::new(None) }; }
+// The main window (`window 0`).
+thread_local! { static MAIN: std::cell::Cell<Option<(AnyWindowHandle, usize)>> = const { std::cell::Cell::new(None) }; }
+/// The recording under way: its start, and where its frames go.
+type Frames = std::sync::mpsc::Sender<(f64, usize, usize, Vec<u8>)>;
+thread_local! { static RECORDING: std::cell::RefCell<Option<(Instant, Frames)>> = const { std::cell::RefCell::new(None) }; }
 static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Move a scripted window off screen where it still renders (unless `FDL_NOPARK`).
@@ -80,6 +106,29 @@ async fn park(ns_view: usize, cx: &mut AsyncApp) {
         }
         eprintln!("devtools: no visible off-screen spot; window may stop rendering");
     }
+}
+
+thread_local! { static WINDOWS: std::cell::RefCell<Vec<(AnyWindowHandle, usize)>> = const { std::cell::RefCell::new(Vec::new()) }; }
+
+/// A window opened beside the main one during a scripted run (a document's
+/// own window): parked like it, and reachable with `window <n>`.
+pub fn opened(window: &mut Window, cx: &mut App) {
+    if std::env::var_os("FDL_SCRIPT").is_none() { return }
+    #[cfg(target_os = "macos")]
+    let Some(ns_view) = ns_view_of(window) else { return };
+    #[cfg(not(target_os = "macos"))]
+    let ns_view = 0usize;
+    WINDOWS.with(|w| w.borrow_mut().push((window.window_handle(), ns_view)));
+    cx.spawn(async move |cx| park(ns_view, cx).await).detach();
+}
+
+/// The windows a script can play in, those closed since left out: the main one first.
+fn script_windows(main: (AnyWindowHandle, usize), cx: &mut AsyncApp) -> Vec<(AnyWindowHandle, usize)> {
+    let open: Vec<AnyWindowHandle> = cx.update(|cx| cx.windows());
+    WINDOWS.with(|w| {
+        w.borrow_mut().retain(|(h, _)| open.contains(h));
+        std::iter::once(main).chain(w.borrow().iter().copied().filter(|(h, _)| *h != main.0)).collect()
+    })
 }
 
 pub fn start(window: &mut Window, cx: &mut App) {
@@ -98,27 +147,128 @@ pub fn start(window: &mut Window, cx: &mut App) {
     // One script per run: a window opened later (first launch's pages hand
     // over to the main window) becomes where the rest of it plays.
     CURRENT.with(|c| c.set(Some((handle, ns_view))));
+    MAIN.with(|c| c.set(Some((handle, ns_view))));
     if RUNNING.swap(true, std::sync::atomic::Ordering::Relaxed) {
         cx.spawn(async move |cx| park(ns_view, cx).await).detach();
         return;
     }
     cx.spawn(async move |cx| {
+        // `FDL_RECORD_START=<file.mp4>`: recording from the window's first frame, before the script starts.
+        let mut recording: Option<std::rc::Rc<std::cell::Cell<bool>>> = std::env::var("FDL_RECORD_START").ok().map(|f| start_recording(handle, &f, cx));
         park(ns_view, cx).await;
-        let mut recording: Option<std::rc::Rc<std::cell::Cell<bool>>> = None;
         // Only leading whitespace is insignificant: `type ab ` types a trailing space.
         for line in script.lines().map(str::trim_start).filter(|l| !l.trim().is_empty() && !l.starts_with('#')) {
             let Some((handle, ns_view)) = CURRENT.with(|c| c.get()) else { break };
             let _ = ns_view;
             let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
+            // `row` / `rrow` / `hoverrow <title>`, `anchor <name>`: the same step at that row's (or control's)
+            // middle, looked up in a fresh frame. Not there: stop rather than click into nothing.
+            let resolved;
+            let (cmd, rest) = match cmd {
+                "row" | "rrow" | "hoverrow" | "anchor" => {
+                    let name = rest.trim();
+                    let at = handle.update(cx, |root, window, cx| {
+                        // This frame's rows only: a sidebar row or menu not drawn since stays out.
+                        rows_begin(window);
+                        window.refresh();
+                        window.draw(cx).clear(cx);
+                        if cmd != "anchor" { return row_center(window, name); }
+                        let ws = root.downcast::<crate::app::Workspace>().map_err(|_| "no workspace window".to_string())?;
+                        let b = ws.read(cx).home.anchor(name).or_else(|| probed_anchor(window, name)).ok_or(format!("no anchor {name:?}"))?;
+                        Ok((f32::from(b.center().x).round(), f32::from(b.center().y).round()))
+                    }).unwrap_or_else(|e| Err(e.to_string()));
+                    match at {
+                        Ok((x, y)) => {
+                            eprintln!("devtools: {cmd} {name:?} at {x} {y}");
+                            resolved = format!("{x} {y}");
+                            (match cmd { "rrow" => "rclick", "hoverrow" => "move", _ => "click" }, resolved.as_str())
+                        }
+                        Err(e) => {
+                            eprintln!("devtools: {cmd}: {e}");
+                            std::process::exit(3);
+                        }
+                    }
+                }
+                "origin" => {
+                    let at = match rest.trim() {
+                        "window" => Ok((0., 0.)),
+                        "board" => handle.update(cx, |root, window, cx| {
+                            if window.needs_draw() { window.draw(cx).clear(cx); }
+                            let ws = root.downcast::<crate::app::Workspace>().map_err(|_| "no workspace window".to_string())?;
+                            let b = ws.read(cx).editor.as_ref().and_then(|e| e.read(cx).board_view()).ok_or("no board open")?.read(cx).bounds.get();
+                            Ok((f32::from(b.origin.x).round(), f32::from(b.origin.y).round()))
+                        }).unwrap_or_else(|e| Err(e.to_string())),
+                        o => Err(format!("unknown origin {o:?}")),
+                    };
+                    match at {
+                        Ok(o) => { eprintln!("devtools: origin {} at {} {}", rest.trim(), o.0, o.1); *ORIGIN.lock().unwrap() = o; continue }
+                        Err(e) => { eprintln!("devtools: origin: {e}"); std::process::exit(3); }
+                    }
+                }
+                // `window <n>`: play in that window from here on; `windows <n>`: that many are open.
+                "window" | "windows" => {
+                    let all = match MAIN.with(|c| c.get()) { Some(main) => script_windows(main, cx), None => vec![] };
+                    let n: usize = rest.trim().parse().unwrap_or(usize::MAX);
+                    if cmd == "windows" && all.len() == n { eprintln!("devtools: windows {n}"); continue }
+                    if cmd == "window" && let Some(w) = all.get(n) {
+                        CURRENT.with(|c| c.set(Some(*w)));
+                        // Let it draw once before the steps that follow.
+                        let _ = w.0.update(cx, |_, window, cx| { window.refresh(); window.draw(cx).clear(cx); });
+                        eprintln!("devtools: window {n}");
+                        continue
+                    }
+                    eprintln!("devtools: {cmd}: wanted {}, {} open", rest.trim(), all.len());
+                    std::process::exit(3);
+                }
+                // `showing <title>`: the document (or folder page) in front has that title; else stop as `row` does.
+                "showing" => {
+                    let want = rest.trim();
+                    let shown = handle.update(cx, |root, _, cx| {
+                        let ws = root.downcast::<crate::app::Workspace>().ok()?;
+                        let w = ws.read(cx);
+                        let id = match w.view { crate::app::View::Doc => w.current.as_deref()?, crate::app::View::Folder => w.folder_current.as_deref()?, _ => return None };
+                        w.entries.iter().find(|e| e.id == id).map(|e| e.title.trim().to_string())
+                    }).ok().flatten();
+                    if shown.as_deref() == Some(want) { eprintln!("devtools: showing {want:?}"); continue }
+                    eprintln!("devtools: showing: wanted {want:?}, in front: {shown:?}");
+                    std::process::exit(3);
+                }
+                _ => { resolved = shifted(cmd, rest); (cmd, resolved.as_str()) }
+            };
             if cmd == "wait" {
                 // Draw invalidated frames ourselves: the display link stops
                 // while the screen is locked, and nothing would render.
                 let end = Instant::now() + Duration::from_millis(rest.trim().parse().unwrap_or(100));
+                // `FDL_ANIMATE`: a frame every 16ms, as the display link would
+                // draw them for animations, recorded as drawn. Timers can't
+                // keep that pace with the display asleep, so the main thread
+                // waits between frames itself.
+                if std::env::var_os("FDL_ANIMATE").is_some() {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        while Instant::now() < end {
+                            let t = Instant::now();
+                            window.refresh();
+                            window.draw(cx).clear(cx);
+                            RECORDING.with(|r| {
+                                if let Some((start, tx)) = &*r.borrow()
+                                    && let Ok((w, h, px)) = frame(window, cx)
+                                {
+                                    let _ = tx.send((start.elapsed().as_secs_f64(), w, h, px));
+                                }
+                            });
+                            // Spinning: a sleep, too, oversleeps several times over.
+                            while t.elapsed() < Duration::from_millis(16) && Instant::now() < end {
+                                std::thread::yield_now();
+                            }
+                        }
+                    });
+                    continue;
+                }
                 while Instant::now() < end {
                     cx.background_executor().timer(Duration::from_millis(16).min(end - Instant::now())).await;
                     let _ = handle.update(cx, |_, window, cx| {
                         if window.needs_draw() {
-                            window.draw(cx).clear();
+                            window.draw(cx).clear(cx);
                         }
                     });
                 }
@@ -151,7 +301,7 @@ pub fn start(window: &mut Window, cx: &mut App) {
                     let t1 = Instant::now();
                     let _ = handle.update(cx, |_, window, cx| {
                         RENDER_NS.store(0, std::sync::atomic::Ordering::Relaxed);
-                        window.draw(cx).clear();
+                        window.draw(cx).clear(cx);
                         let render = RENDER_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
                         samples.push(((t1 - t0).as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3, render));
                     });
@@ -163,8 +313,11 @@ pub fn start(window: &mut Window, cx: &mut App) {
                     let at = |q: f64| v.get(((v.len() as f64 - 1.) * q).round() as usize).copied().unwrap_or(0.);
                     format!("p50 {:.2} p95 {:.2} max {:.2}", at(0.5), at(0.95), at(1.))
                 };
+                let mean = samples.iter().map(|s| s.1).sum::<f64>() / samples.len().max(1) as f64;
+                let drops = samples.iter().filter(|s| s.1 > 1000. / 60.).count();
+                let drops120 = samples.iter().filter(|s| s.1 > 1000. / 120.).count();
                 eprintln!(
-                    "bench {step:?} x{}: step [{}] frame [{}] editor render [{}] ms",
+                    "bench {step:?} x{}: frame mean {mean:.2} drops {drops} over 8.3 {drops120}: step [{}] frame [{}] editor render [{}] ms",
                     samples.len(),
                     stat(|s| s.0),
                     stat(|s| s.1),
@@ -176,6 +329,7 @@ pub fn start(window: &mut Window, cx: &mut App) {
             if cmd == "record" || (quit && recording.is_some()) {
                 if let Some(stop) = recording.take() {
                     stop.set(true);
+                    RECORDING.with(|r| *r.borrow_mut() = None);
                     *CURSOR_LOG.lock().unwrap() = None;
                     // Lets the writer drain and ffmpeg finish the file.
                     cx.background_executor().timer(Duration::from_millis(300)).await;
@@ -215,7 +369,7 @@ pub fn start(window: &mut Window, cx: &mut App) {
                     let mut done = 0.;
                     for i in 1..=steps {
                         let to = n[2] * ease(i as f32 / steps as f32);
-                        let event = ScrollWheelEvent {
+                        let event = ScrollEvent {
                             position: point(px(n[0]), px(n[1])),
                             // Positive dy scrolls the content up (reading on).
                             delta: ScrollDelta::Pixels(point(px(0.), px(done - to))),
@@ -223,7 +377,7 @@ pub fn start(window: &mut Window, cx: &mut App) {
                         };
                         done = to;
                         let _ = handle.update(cx, |_, window, cx| {
-                            window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
+                            window.dispatch_event(PlatformInput::Scroll(event), cx);
                         });
                         cx.background_executor().timer(Duration::from_millis(16)).await;
                     }
@@ -244,6 +398,15 @@ pub fn start(window: &mut Window, cx: &mut App) {
             }
             #[cfg(target_os = "macos")]
             if cmd == "mark" || cmd == "commit" {
+                // A frame first, as one always comes between a click and a
+                // person's typing: a click that opens a text field (the
+                // board's text tool) gets its input handler when that paints,
+                // and text sent before it went nowhere.
+                let _ = handle.update(cx, |_, window, cx| {
+                    if window.needs_draw() {
+                        window.draw(cx).clear(cx);
+                    }
+                });
                 native::ime(ns_view, cmd == "commit", rest);
                 cx.background_executor().timer(Duration::from_millis(120)).await;
                 continue;
@@ -252,7 +415,7 @@ pub fn start(window: &mut Window, cx: &mut App) {
                 cx.update(|cx| {
                     let handle = cx.windows().into_iter().find_map(|w| w.downcast::<crate::app::Workspace>()).unwrap();
                     handle.update(cx, |ws, window, cx| ws.check_export_safety(window, cx)).unwrap();
-                }).unwrap();
+                });
                 continue;
             }
             // `filedrag x y a|b`, `filedrop x y`, `fileleave`: files dragged in from the Finder.
@@ -283,11 +446,26 @@ pub fn start(window: &mut Window, cx: &mut App) {
                         Some(p) => { if !ws.sidebar_drop_at(at, false, cx) { ws.file_drag_at(at, p, cx); } }
                         None => cx.notify(),
                     }).unwrap();
-                }).unwrap();
+                });
+                continue;
+            }
+            if cmd == "mods" {
+                let flag = |w: &str| match w { "shift" => 1u64 << 17, "ctrl" => 1 << 18, "alt" => 1 << 19, "cmd" => 1 << 20, _ => 0 };
+                MODS.store(rest.split_whitespace().map(flag).fold(0, |a, b| a | b), std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            if cmd == "check-priority" {
+                let ws = handle.downcast::<crate::app::Workspace>().unwrap();
+                ws.update(cx, |ws, window, cx| priority::step(rest, ws, window, cx)).unwrap();
+                continue;
+            }
+            if cmd == "check-board-reload" {
+                let ws = handle.downcast::<crate::app::Workspace>().unwrap();
+                ws.update(cx, |ws, window, cx| board_reload::step(rest, ws, window, cx)).unwrap();
                 continue;
             }
             if cmd == "check-save-safety" {
-                cx.update(|cx| crate::app::check_save_safety(rest.trim(), cx)).unwrap();
+                cx.update(|cx| crate::app::check_save_safety(rest.trim(), cx));
                 continue;
             }
             #[cfg(target_os = "macos")]
@@ -298,14 +476,102 @@ pub fn start(window: &mut Window, cx: &mut App) {
                 let _ = handle.update(cx, |_, window, cx| run(cmd, rest, window, cx));
             }
             if quit {
-                let _ = cx.update(|cx| cx.quit());
+                cx.update(|cx| cx.quit());
                 return;
             }
             // Let the frame settle before the next step.
             cx.background_executor().timer(Duration::from_millis(120)).await;
         }
+        // A script that ends without `quit` quits anyway, so no scripted
+        // window is left behind; `FDL_KEEP_OPEN` keeps it to look at.
+        if std::env::var_os("FDL_KEEP_OPEN").is_none() {
+            if let Some(stop) = recording.take() {
+                stop.set(true);
+                RECORDING.with(|r| *r.borrow_mut() = None);
+                *CURSOR_LOG.lock().unwrap() = None;
+                cx.background_executor().timer(Duration::from_millis(300)).await;
+            }
+            cx.update(|cx| cx.quit());
+        }
     })
     .detach();
+}
+
+type Drawn = std::cell::RefCell<std::collections::HashMap<WindowId, Vec<(String, Bounds<Pixels>)>>>;
+
+thread_local! {
+    /// The sidebar rows drawn in each window's last frame: title, and the part of the row on screen.
+    static ROWS: Drawn = Default::default();
+    /// Controls that `anchor_probe` named, the same way (the app's own anchors are `Home::anchor`).
+    static ANCHORS: Drawn = Default::default();
+}
+
+/// The sidebar is being built for a new frame: forget the last one's rows.
+pub fn rows_begin(window: &Window) {
+    let id = window.window_handle().window_id();
+    ROWS.with(|r| r.borrow_mut().insert(id, vec![]));
+    ANCHORS.with(|r| r.borrow_mut().insert(id, vec![]));
+}
+
+fn probe(list: &'static std::thread::LocalKey<Drawn>, title: SharedString) -> Option<AnyElement> {
+    Some(canvas(move |b, window, _| {
+        let shown = window.content_mask().bounds.intersect(&b);
+        if shown.size.width > px(2.) && shown.size.height > px(2.) {
+            list.with(|r| r.borrow_mut().entry(window.window_handle().window_id()).or_default().push((title.to_string(), shown)));
+        }
+    }, |_, _, _, _| {}).absolute().inset_0().into_any_element())
+}
+
+/// Put inside a (relative) sidebar row or menu item (`design::MenuItem` does): records where
+/// `title`'s row is drawn, for `row` and friends.
+pub fn row_probe(title: impl Into<SharedString>) -> Option<AnyElement> { probe(&ROWS, title.into()) }
+
+/// Put inside a (relative) control to click by `anchor <name>`, where the app keeps no anchor
+/// of its own (外观's font pickers, a downloaded font's delete button).
+pub fn anchor_probe(name: impl Into<SharedString>) -> Option<AnyElement> { probe(&ANCHORS, name.into()) }
+
+/// The middle of the control `anchor_probe` named `name` in this frame.
+fn probed_anchor(window: &Window, name: &str) -> Option<Bounds<Pixels>> {
+    ANCHORS.with(|r| r.borrow().get(&window.window_handle().window_id()).and_then(|v| v.iter().find(|(t, _)| t == name).map(|(_, b)| *b)))
+}
+
+/// The middle of the topmost sidebar row titled `title` in the window's last frame.
+fn row_center(window: &Window, title: &str) -> Result<(f32, f32), String> {
+    ROWS.with(|r| {
+        let r = r.borrow();
+        let rows = r.get(&window.window_handle().window_id()).map_or(&[][..], |v| &v[..]);
+        rows.iter().filter(|(t, _)| t == title).min_by(|a, b| a.1.origin.y.partial_cmp(&b.1.origin.y).unwrap())
+            .map(|(_, b)| (f32::from(b.center().x).round(), f32::from(b.center().y).round()))
+            .ok_or_else(|| format!("no sidebar row or menu item titled {title:?}; shown: {:?}", rows.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>()))
+    })
+}
+
+/// `rest` of a step with its points moved by `ORIGIN`: the first point of the pointer and file steps,
+/// both of `drag`'s, the inner step of `bench`. Offsets (`dragby`, wheel deltas) stay as written.
+fn shifted(cmd: &str, rest: &str) -> String {
+    let (ox, oy) = *ORIGIN.lock().unwrap();
+    if (ox, oy) == (0., 0.) { return rest.to_string() }
+    let points = match cmd {
+        "move" | "click" | "dclick" | "rclick" | "down" | "dragto" | "up" | "mdown" | "mdragto" | "mup" | "wheel" | "pinch" | "glide" | "scroll" | "filedrag" | "filedrop" => 1,
+        "drag" => 2,
+        "bench" => {
+            let (n, step) = rest.trim().split_once(' ').unwrap_or((rest.trim(), ""));
+            let (scmd, srest) = step.split_once(' ').unwrap_or((step, ""));
+            return format!("{n} {scmd} {}", shifted(scmd, srest));
+        }
+        _ => 0,
+    };
+    if points == 0 { return rest.to_string() }
+    let mut out = vec![];
+    let mut tail = rest.trim_start();
+    for i in 0..points * 2 {
+        let (v, t) = tail.split_once(' ').unwrap_or((tail, ""));
+        let Ok(v) = v.parse::<f32>() else { break };
+        out.push((v + if i % 2 == 0 { ox } else { oy }).to_string());
+        tail = t.trim_start();
+    }
+    if !tail.is_empty() { out.push(tail.to_string()); }
+    out.join(" ")
 }
 
 fn nums(s: &str) -> Vec<f32> {
@@ -333,8 +599,10 @@ mod native {
     /// Places scripted windows almost entirely past a screen edge that has no
     /// neighbouring display, so they neither cover the user's windows nor get
     /// covered (fully occluded windows stop rendering). Returns the candidate
-    /// origins, best first; the caller tries them until one stays visible
-    /// (a sliver behind the Dock counts as occluded).
+    /// origins, best first: the rightmost spot first, so with several displays
+    /// the sliver sits on the outer edge of the rightmost one rather than under
+    /// the windows on the main display. The caller tries them until one stays
+    /// visible (a sliver behind the Dock counts as occluded).
     pub fn park_candidates(ns_view: usize) -> Vec<CGPoint> {
         use core_graphics::geometry::CGSize;
         const SLIVER: f64 = 24.;
@@ -376,6 +644,7 @@ mod native {
                     }
                 }
             }
+            out.sort_by(|a, b| b.x.total_cmp(&a.x));
             out
         }
     }
@@ -515,7 +784,7 @@ mod native {
             let ev: *mut Object = msg_send![class!(NSEvent),
                 mouseEventWithType: kind
                 location: loc
-                modifierFlags: 0u64
+                modifierFlags: super::MODS.load(std::sync::atomic::Ordering::Relaxed)
                 timestamp: 0f64
                 windowNumber: number
                 context: nil
@@ -643,7 +912,7 @@ fn run(cmd: &str, rest: &str, window: &mut Window, cx: &mut App) {
         }
         "key" => {
             for k in rest.split_whitespace() {
-                match Keystroke::parse(k) {
+                match crate::shortcuts::parse_key(k) {
                     Ok(ks) => {
                         let handled = window.dispatch_keystroke(ks, cx);
                         if std::env::var_os("FDL_TRACE").is_some() {
@@ -669,6 +938,8 @@ fn run(cmd: &str, rest: &str, window: &mut Window, cx: &mut App) {
             let cur = fake.get_or_insert_with(Default::default);
             match kind {
                 "clear" => *cur = Default::default(),
+                // what a copy put there (its text), for the script to check
+                "save" => { let _ = std::fs::write(path.trim(), &cur.text); }
                 "image" => {
                     let bytes = std::fs::read(path.trim()).expect("clip image file");
                     let format = image::guess_format(&bytes).ok().and_then(|f| ImageFormat::from_mime_type(f.to_mime_type())).expect("clip image format");
@@ -709,14 +980,21 @@ fn run(cmd: &str, rest: &str, window: &mut Window, cx: &mut App) {
         "wheel" => {
             let n = nums(rest);
             if n.len() >= 3 {
-                let event = ScrollWheelEvent {
+                let event = ScrollEvent {
                     position: point(px(n[0]), px(n[1])),
                     // An optional fourth number is a sideways component, as a
                     // trackpad swipe carries; positive reveals content on the right.
                     delta: ScrollDelta::Pixels(point(px(-n.get(3).copied().unwrap_or(0.)), px(-n[2]))),
                     ..Default::default()
                 };
-                window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
+                window.dispatch_event(PlatformInput::Scroll(event), cx);
+            }
+        }
+        "pinch" => {
+            let n = nums(rest);
+            if n.len() >= 3 {
+                let event = PinchEvent { position: point(px(n[0]), px(n[1])), delta: n[2], ..Default::default() };
+                window.dispatch_event(PlatformInput::Pinch(event), cx);
             }
         }
         "resize" => {
@@ -736,9 +1014,13 @@ fn run(cmd: &str, rest: &str, window: &mut Window, cx: &mut App) {
 /// to the window server's copy, which also has the system-drawn traffic lights.
 fn frame(window: &mut Window, cx: &mut App) -> anyhow::Result<(usize, usize, Vec<u8>)> {
     if std::env::var_os("FDL_WINDOW_CAPTURE").is_none()
-        && let Some(image) = window.render_offscreen(cx)
+        && let Ok(image) = window.render_offscreen(cx)
     {
-        return Ok(image);
+        let (w, h) = (image.width() as usize, image.height() as usize);
+        let mut px = image.into_raw();
+        // RGBA → BGRA, as the window server's capture has it.
+        for p in px.as_chunks_mut::<4>().0 { p.swap(0, 2); }
+        return Ok((w, h, px));
     }
     grab(window)
 }
@@ -834,12 +1116,13 @@ fn start_recording(handle: AnyWindowHandle, path: &str, cx: &mut AsyncApp) -> st
         let mut next = 0u64;
         while let Ok((t, w, h, mut px)) = rx.recv() {
             let enc = ffmpeg.get_or_insert_with(|| {
-                std::process::Command::new("ffmpeg")
-                    .args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgra", "-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"])
+                let mut c = std::process::Command::new("ffmpeg");
+                c.args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgra", "-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"])
                     .args(["-c:v", "libx264", "-preset", "ultrafast", "-crf", "6", "-pix_fmt", "yuv444p", &out])
-                    .stdin(std::process::Stdio::piped())
-                    .spawn()
-                    .expect("ffmpeg")
+                    .stdin(std::process::Stdio::piped());
+                #[cfg(target_os = "windows")]
+                { use std::os::windows::process::CommandExt; c.creation_flags(0x0800_0000); }
+                c.spawn().expect("ffmpeg")
             });
             for p in px.as_chunks_mut::<4>().0 {
                 p[3] = 255;
@@ -858,6 +1141,7 @@ fn start_recording(handle: AnyWindowHandle, path: &str, cx: &mut AsyncApp) -> st
         }
         eprintln!("devtools: recorded {out} ({next} frames)");
     });
+    RECORDING.with(|r| *r.borrow_mut() = Some((start, tx.clone())));
     let flag = stop.clone();
     cx.spawn(async move |cx| {
         while !flag.get() {

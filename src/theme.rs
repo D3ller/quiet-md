@@ -24,8 +24,8 @@ pub fn glass() -> bool {
         static GLASS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *GLASS.get_or_init(|| windows_build().is_some_and(|b| b >= 22621))
     }
-    #[cfg(target_os = "linux")] { false }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))] { true }
+    #[cfg(any(target_os = "linux", target_family = "wasm"))] { false }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_family = "wasm")))] { true }
 }
 
 #[cfg(target_os = "windows")]
@@ -42,10 +42,12 @@ static DARK: AtomicBool = AtomicBool::new(false);
 thread_local! {
     /// Exports and printing draw light whatever the window shows.
     static FORCE_LIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The look a `with_dark` block draws in, over the window's (the component panel's light and dark side by side).
+    static SCHEME: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static ADAPTED: std::cell::RefCell<std::collections::HashMap<[u32; 4], Hsla>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-pub fn dark() -> bool { DARK.load(Ordering::Relaxed) && !FORCE_LIGHT.with(|f| f.get()) }
+pub fn dark() -> bool { !FORCE_LIGHT.with(|f| f.get()) && SCHEME.with(|s| s.get()).unwrap_or_else(|| DARK.load(Ordering::Relaxed)) }
 
 /// Full screen: no desktop behind the window, so the sidebar is a solid colour, not glass.
 static FULLSCREEN: AtomicBool = AtomicBool::new(false);
@@ -54,6 +56,13 @@ pub fn fullscreen() -> bool { FULLSCREEN.load(Ordering::Relaxed) }
 pub fn set_fullscreen(on: bool) -> bool { FULLSCREEN.swap(on, Ordering::Relaxed) != on }
 /// Switch the look; true when it changed.
 pub fn set_dark(on: bool) -> bool { DARK.swap(on, Ordering::Relaxed) != on }
+/// Run `f` in the dark look (`true`) or the light one, whatever the window shows.
+pub fn with_dark<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = SCHEME.with(|s| s.replace(Some(on)));
+    let r = f();
+    SCHEME.with(|s| s.set(was));
+    r
+}
 /// Run `f` with the light colours (HTML export, printing, copy as rich text).
 pub fn light<R>(f: impl FnOnce() -> R) -> R {
     let was = FORCE_LIGHT.with(|l| l.replace(true));
@@ -87,39 +96,62 @@ fn to_dark(c: Hsla) -> Hsla {
     srgb(l2, oa, ob, a)
 }
 
-/// The text highlight to draw for light-look highlight `c`: in dark mode
-/// the same colour the light page shows (`c` over white, made opaque). Kept
-/// translucent it lets the dark page through and turns muddy. Text on it
-/// takes the light page's ink, see `on_mark`.
+/// WCAG relative luminance of an opaque colour.
+fn luminance(c: Hsla) -> f32 {
+    let Rgba { r, g, b, .. } = Rgba::from(c);
+    let ch = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+}
+
+/// Text in colour (a link, a font colour, a list marker) on the dark page, lifted until it reads:
+/// vivid colours keep their own lightness in `to_dark`, which leaves a link blue or a red at about
+/// 4:1 on the page; this raises the OKLab lightness (hue and chroma kept) until the colour is `min`
+/// times the page's contrast (4.5 for text, 3 for marks). The light look and colours that already
+/// read are unchanged.
+pub fn lift(c: Hsla, min: f32) -> Hsla {
+    if !dark() { return c }
+    let pc = Rgba::from(adapt(gpui::white()));
+    let page = luminance(pc.into());
+    // a translucent colour (Obsidian's faint greys) reads as what it makes over the page
+    let Rgba { r, g, b, a } = Rgba::from(c);
+    let over = |v: f32, p: f32| p + (v - p) * a;
+    let c: Hsla = Rgba { r: over(r, pc.r), g: over(g, pc.g), b: over(b, pc.b), a: 1. }.into();
+    let reads = |x: Hsla, m: f32| (luminance(x) + 0.05) / (page + 0.05) >= m;
+    if reads(c, min) { return c }
+    // lifted past `min`: antialiased strokes and 1px edges read about a tenth below their colour
+    let min = min * 1.15;
+    let reads = |x: Hsla| reads(x, min);
+    let Rgba { r, g, b, a } = Rgba::from(c);
+    let [l, oa, ob] = oklab(r, g, b);
+    let mut up = l;
+    while up < 0.98 {
+        up = (up + 0.01).min(0.98);
+        let x = srgb(up, oa, ob, a);
+        if reads(x) { return x }
+    }
+    srgb(0.98, oa, ob, a)
+}
+
+/// The text highlight to draw for light-look highlight `c` (a marker colour at its strength, 35% or
+/// 65%): in dark mode a deep tint of the same hue laid into the page, opaque, so the highlight reads
+/// as a highlight without lighting up like a lamp (it used to be the light page's pale colour, a
+/// bright block in the dark). Text on it keeps the dark page's ink, see `on_mark`.
 pub fn mark(c: Hsla) -> Hsla {
     if !dark() { return c }
     let Rgba { r, g, b, a } = Rgba::from(c);
-    let w = |v: f32| v * a + 1. - a;
-    Rgba { r: w(r), g: w(g), b: w(b), a: 1. }.into()
+    let Rgba { r: pr, g: pg, b: pb, .. } = Rgba::from(adapt(gpui::white()));
+    // the stronger the marker, the more of its hue (35% → 0.22, 65% → 0.28): dark enough that the
+    // page's ink reads on it at 4.5:1
+    let k = 0.15 + 0.2 * a;
+    let m = |v: f32, p: f32| p + (v - p) * k;
+    Rgba { r: m(r, pr), g: m(g, pg), b: m(b, pb), a: 1. }.into()
 }
 
-/// Text drawn on a highlight (`color`, already adapted). In dark mode it
-/// gets back its light-page ink: the mirror undone (the near-white text →
-/// L 0.25), at most L 0.55 so coloured text (red on light red) reads as it
-/// does on the light page.
+/// Text drawn on a highlight (`color`, already adapted). On the dark tint `mark` gives it stays the
+/// dark page's ink, lifted where a coloured run would sink into its own tint (`lift`).
 pub fn on_mark(c: Hsla) -> Hsla {
     if !dark() { return c }
-    let Rgba { r, g, b, a } = Rgba::from(c);
-    let [l, oa, ob] = oklab(r, g, b);
-    let l2 = ((1.137 - l) / 0.907).clamp(0., 0.55);
-    let chroma = (oa * oa + ob * ob).sqrt();
-    let (sin, cos) = if chroma > 1e-4 { (ob / chroma, oa / chroma) } else { (0., 1.) };
-    let k = in_gamut(l2, chroma, cos, sin);
-    srgb(l2, k * cos, k * sin, a)
-}
-
-/// The largest chroma ≤ `max` at lightness `l` and hue (`cos`, `sin`) inside sRGB.
-fn in_gamut(l: f32, max: f32, cos: f32, sin: f32) -> f32 {
-    let fits = |k: f32| lrgb(l, k * cos, k * sin).iter().all(|v| (-1e-4..=1. + 1e-4).contains(v));
-    if fits(max) { return max }
-    let (mut lo, mut hi) = (0., max);
-    for _ in 0..16 { let m = (lo + hi) / 2.; if fits(m) { lo = m } else { hi = m } }
-    lo
+    lift(c, 4.5)
 }
 
 // sRGB ⇄ OKLab with Björn Ottosson's matrices, kept digit for digit.
@@ -271,7 +303,7 @@ pub mod craft {
 /// Shadows stay black; on the dark page they need more weight to show.
 fn shadow(a: f32, y: f32, blur: f32, spread: f32) -> BoxShadow {
     let a = if dark() { (a * 3.).min(0.6) } else { a };
-    BoxShadow { color: rgbaf(0, 0, 0, a), offset: point(px(0.), px(y)), blur_radius: px(blur), spread_radius: px(spread) }
+    BoxShadow { color: rgbaf(0, 0, 0, a), offset: point(px(0.), px(y)), blur_radius: px(blur), spread_radius: px(spread), inset: false }
 }
 
 /// Menus and dropdowns: macOS 26 menu panel, soft and wide.
@@ -289,11 +321,6 @@ pub fn shadow_dialog() -> Vec<BoxShadow> {
     vec![shadow(0.06, 2., 8., 0.), shadow(0.16, 24., 64., 0.)]
 }
 
-/// Larger menus (「…」, home menus, icon picker): same family as menus.
-pub fn shadow_s4_down() -> Vec<BoxShadow> {
-    vec![shadow(0.05, 1., 3., 0.), shadow(0.11, 10., 28., 0.)]
-}
-
 /// Cards resting on the sidebar (更新日志): a faint lift, no border.
 pub fn shadow_card() -> Vec<BoxShadow> {
     vec![shadow(0.04, 1., 2., 0.), shadow(0.06, 4., 14., 0.)]
@@ -305,23 +332,38 @@ pub fn shadow_sheet() -> Vec<BoxShadow> {
     vec![shadow(0.035, 8., 22., -2.)]
 }
 
+/// The note plane's left edge over the sidebar: a faint shade cast leftward, so the
+/// two read as layers. The plane meets the window's other edges, where nothing shows.
+pub fn shadow_note() -> Vec<BoxShadow> {
+    let mut v = vec![shadow(0.012, 0., 1., 0.), shadow(0.014, 0., 6., 0.)];
+    v[1].offset.x = px(-1.);
+    v
+}
+
 /// Header buttons and other white pills on a white panel (back / share).
 pub fn shadow_button() -> Vec<BoxShadow> {
     vec![shadow(0.05, 1., 1.5, 0.)]
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-pub const UI_FONT: &str = ".SystemUIFont";
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub const UI_FONT: &str = "Noto Sans";
-pub const NUMERAL_FONT: &str = if cfg!(any(target_os = "macos", target_os = "windows")) { "Helvetica Neue" } else { UI_FONT };
+/// The platform's sans: the interface's family unless 外观 › 界面字体 says
+/// otherwise, and the document's when its theme names no family.
+#[cfg(any(target_vendor = "apple", target_os = "windows"))]
+pub const SYSTEM_FONT: &str = ".SystemUIFont";
+#[cfg(not(any(target_vendor = "apple", target_os = "windows", target_family = "wasm")))]
+pub const SYSTEM_FONT: &str = "Noto Sans";
+/// The web build brings its own fonts (src/web.rs).
+#[cfg(target_family = "wasm")]
+pub const SYSTEM_FONT: &str = "Inter";
+pub const NUMERAL_FONT: &str = if cfg!(any(target_vendor = "apple", target_os = "windows")) { "Helvetica Neue" } else { SYSTEM_FONT };
 /// Platform monospace font.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub const MONO_FONT: &str = ".AppleSystemUIFontMonospaced";
 #[cfg(target_os = "windows")]
 pub const MONO_FONT: &str = "Consolas";
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_vendor = "apple", target_os = "windows", target_family = "wasm")))]
 pub const MONO_FONT: &str = "Noto Sans Mono";
+#[cfg(target_family = "wasm")]
+pub const MONO_FONT: &str = "JetBrains Mono";
 
 pub struct Theme;
 
@@ -332,14 +374,15 @@ impl Theme {
     pub fn text_placeholder() -> Hsla { c(craft::N500) }
     /// Empty-block hints: placeholders are text at ~25%.
     pub fn block_placeholder() -> Hsla { ca(craft::N900, 0.25) }
-    pub fn text_disabled() -> Hsla { ca(craft::N900, 0.3) }
+    /// Dark mode: 40%, as 30% of the light ink on a raised surface fades out (GitHub #319).
+    pub fn text_disabled() -> Hsla { ca(craft::N900, if dark() { 0.4 } else { 0.3 }) }
     /// Toolbar glyphs.
     pub fn text_code() -> Hsla { c(craft::N800) }
     /// The link colour: the content accent (#0087FF) blended half-way to the
     /// text colour, #0F5492 measured.
-    pub fn link() -> Hsla { mix(0x0087ff, craft::N900, 0.5) }
+    pub fn link() -> Hsla { lift(mix(0x0087ff, craft::N900, 0.5), 4.5) }
     /// A hovered link or document chip: a step closer to the text colour.
-    pub fn link_hover() -> Hsla { mix(0x0087ff, craft::N900, 0.65) }
+    pub fn link_hover() -> Hsla { lift(mix(0x0087ff, craft::N900, 0.65), 4.5) }
     pub fn primary() -> Hsla { c(craft::B500) }
     pub fn primary_500() -> Hsla { c(craft::B500) }
     pub fn primary_fill_1() -> Hsla { c(craft::B50) }
@@ -399,7 +442,10 @@ impl Theme {
         // 外观 › 窗口背景: an opaque window keeps a moving desktop from showing
         // through the sidebar (which some people find distracting).
         if crate::settings::prefs().opaque_window || fullscreen() { return ca(craft::WINDOW, 1.) }
-        if crate::native_header::supported() { ca(craft::WINDOW, 0.) } else if crate::theme::glass() { ca(craft::WINDOW, 0.84) } else { ca(craft::WINDOW, 1.) }
+        // Liquid Glass stays bright over a light desktop even in the dark appearance (a washed grey
+        // under light text): in the dark the sidebar lays a deep wash over it, so it reads as Finder's
+        // and Notes' dark sidebars do and the desktop only colours it; in the light, none.
+        if crate::native_header::supported() { ca(craft::WINDOW, if dark() { 0.82 } else { 0. }) } else if crate::theme::glass() { ca(craft::WINDOW, 0.84) } else { ca(craft::WINDOW, 1.) }
     }
 
     /// Sidebar row label: text at 85%.
@@ -457,6 +503,20 @@ pub fn ui_font() -> f32 {
 /// The same scale for secondary rows (descriptions, counts).
 pub fn ui_font_small() -> f32 { ui_font() - 1. }
 
+/// 外观 › 界面字体: the family the sidebar, menus and settings are drawn in.
+/// `None` is the platform's own sans. (The note has its own setting; a theme
+/// that names a family keeps it there.)
+static UI_FAMILY: std::sync::RwLock<Option<&'static str>> = std::sync::RwLock::new(None);
+
+pub fn set_ui_family(family: &str) { crate::fonts::store(&UI_FAMILY, family) }
+
+pub fn ui_family() -> &'static str { UI_FAMILY.read().unwrap().unwrap_or(SYSTEM_FONT) }
+
+/// Labels drawn as part of a document rather than around it — list numbers,
+/// mentions, captions, a table's cells, a board: the platform's sans, which
+/// neither 界面字体 nor 文档字体 changes (the latter is for prose).
+pub const DOC_UI_FONT: &str = SYSTEM_FONT;
+
 #[allow(unused_imports)]
 pub use crate::palette::{HUES, FONT_COLORS, BG_COLORS, CALLOUT_BG_COLORS, CELL_BG_COLORS, bg_canon};
 
@@ -497,7 +557,7 @@ fn split(name: &str) -> Option<(&str, bool)> {
 
 /// Font colour swatches as the colour panel shows them (first = default).
 pub fn text_color(name: &str) -> Option<Hsla> {
-    hue::of(name).map(|h| c(h.0))
+    hue::of(name).map(|h| lift(c(h.0), 4.5))
 }
 
 /// Text highlight: the marker colours at 35% (yellow #FFF100 → #FFFAA6
@@ -552,7 +612,8 @@ pub const SIDEBAR_MAX: f32 = 800.0;
 pub const SIDEBAR_MIN_CONTENT: f32 = 540.0;
 /// Left inset of the header controls that sit beside the macOS traffic lights.
 // On PC, 12pt padding + 4pt margin + half the 28pt button aligns with the sidebar icon at 30pt.
-pub const TRAFFIC_LIGHTS_W: f32 = if cfg!(target_os = "macos") { 92.0 } else { 12.0 };
+// The web demo is framed as a macOS window, its traffic lights drawn by the page.
+pub const TRAFFIC_LIGHTS_W: f32 = if cfg!(any(target_os = "macos", target_family = "wasm")) { 92.0 } else { 12.0 };
 
 /// (font size, line height, margin top, margin bottom) per block.
 pub struct BlockMetrics {

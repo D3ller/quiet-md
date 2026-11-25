@@ -5,13 +5,14 @@
 //! complete files (`assets/themes/*.css`); the user's own live in
 //! `<library>/themes/*.css`, and one named after a built-in replaces it.
 
+use fdl_core::vfs::PathExt as _;
 use crate::editor_theme::TOKENS;
 use gpui::Hsla;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{LazyLock, RwLock};
 
 // ---- what a theme can set
@@ -63,11 +64,12 @@ pub struct Prop {
     pub feishu: Def,
 }
 
-/// The system families generic CSS names resolve to.
-pub const SYSTEM: &str = crate::theme::UI_FONT;
-#[cfg(not(target_os = "linux"))]
+/// The system families generic CSS names resolve to (the platform's own, not
+/// the reader's 界面字体: the note's default must not follow the chrome's).
+pub const SYSTEM: &str = crate::theme::SYSTEM_FONT;
+#[cfg(not(any(target_os = "linux", target_family = "wasm")))]
 pub const SYSTEM_MONO: &str = ".AppleSystemUIFontMonospaced";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_family = "wasm"))]
 pub const SYSTEM_MONO: &str = crate::theme::MONO_FONT;
 
 pub static PROPS: LazyLock<Vec<Prop>> = LazyLock::new(|| {
@@ -99,23 +101,24 @@ pub static PROPS: LazyLock<Vec<Prop>> = LazyLock::new(|| {
             p(h, "font-size", &format!("{h}.size"), Len, N(c.size), N(f.size)),
             p(h, "line-height", &format!("{h}.line"), Len, N(c.line_height), N(f.line_height)),
             p(h, "font-weight", &format!("{h}.weight"), Weight, N(crate::theme::heading_weight(l).0), N(500.)),
-            p(h, "color", &format!("{h}.color"), Color, Inherit, Unused),
+            p(h, "color", &format!("{h}.color"), Color, Inherit, Inherit),
             p(h, "margin-top", &format!("{h}.mt"), Len, N(c.mt), N(f.mt)),
             p(h, "margin-bottom", &format!("{h}.mb"), Len, N(c.mb), N(f.mb)),
         ]);
     }
     v.extend([
         p("strong", "font-weight", "strong.weight", Weight, N(700.), Unused),
-        p("strong", "color", "strong.color", Color, Inherit, Unused),
+        p("strong", "color", "strong.color", Color, Inherit, Inherit),
+        p("em", "color", "em.color", Color, Inherit, Inherit),
         p("a", "color", "a.color", Color, Tok("link"), Tok("link")),
         p("a", "text-decoration", "a.underline", Underline, B(false), Unused),
         p("a", "text-decoration-color", "a.underline-color", Color, Inherit, Unused),
         p("a:hover", "color", "a.hover", Color, Tok("link_hover"), Tok("link_hover")),
-        p("code", "color", "code.color", Color, Inherit, Unused),
+        p("code", "color", "code.color", Color, Inherit, Inherit),
         p("code", "background-color", "code.bg", Color, Tok("code_chip"), Unused),
         p("code", "border-color", "code.border", Color, Tok("code_chip_border"), Unused),
-        p("code", "border-radius", "code.radius", Len, N(3.), Unused),
-        p("code", "padding-left", "code.pad", Len, N(4.), Unused),
+        p("code", "border-radius", "code.radius", Len, N(3.), N(4.)),
+        p("code", "padding-left", "code.pad", Len, N(4.), N(2.)),
         p("pre", "font-family", "pre.font", Font, Family(SYSTEM_MONO), Family(crate::feishu_theme::MONO_FONT)),
         p("pre", "font-size", "pre.size", Len, N(13.), Unused),
         p("pre", "line-height", "pre.line", Len, N(20.), Unused),
@@ -179,6 +182,7 @@ fn canon_sel(s: &str) -> String {
     match s.as_str() {
         "body" | ".markdown" | ".editor" => ".page".into(),
         "b" => "strong".into(),
+        "i" => "em".into(),
         ".inline-code" | "p code" | ":not(pre) > code" => "code".into(),
         ".code-block" | "pre code" => "pre".into(),
         ".quote" => "blockquote".into(),
@@ -224,6 +228,22 @@ impl Style {
     }
     /// A colour property: its own value, its token's, or `None` (inherit).
     pub fn color(&self, key: &str) -> Option<Hsla> {
+        // a link and the list markers are coloured text on the page: lifted until they read in the
+        // dark (`theme::lift`; 4.5:1 for the link, 3:1 for a marker and the checkbox edge)
+        let min = match key { "a.color" => Some(4.5), "bullet.color" | "number.color" | "task.border" => Some(3.), _ => None };
+        // the check mark sits on the checkbox's vivid fill, which keeps its lightness in the dark: it
+        // stays the colour the theme gives (white), not mirrored to near-black (the home cards draw it white)
+        if key == "task.check" {
+            return match self.values.get(key) {
+                Some(Val::C(c)) => Some(*c),
+                Some(Val::Inherit) => None,
+                _ => match self.def(key) { Def::Rgb(v) => Some(gpui::rgb(v).into()), _ => self.color_raw(key) },
+            };
+        }
+        let c = self.color_raw(key);
+        match min { Some(m) => c.map(|c| crate::theme::lift(c, m)), None => c }
+    }
+    fn color_raw(&self, key: &str) -> Option<Hsla> {
         match self.values.get(key) {
             Some(Val::C(c)) => Some(crate::theme::adapt(*c)),
             Some(Val::Inherit) => None,
@@ -309,7 +329,81 @@ pub fn active() -> &'static Style {
     let p = ACTIVE.load(Ordering::Relaxed);
     if p.is_null() { &PLAIN } else { unsafe { &*p } }
 }
-pub fn color(i: usize) -> Option<Hsla> { active().tokens.get(i).copied().flatten().map(crate::theme::adapt) }
+pub fn color(i: usize) -> Option<Hsla> {
+    let c = active().tokens.get(i).copied().flatten().map(crate::theme::adapt)?;
+    // a link is coloured text on the page: lifted until it reads in the dark, like `a.color`
+    Some(if TOKENS[i].starts_with("link") { crate::theme::lift(c, 4.5) } else { c })
+}
+
+/// 设置 › 文档字体: a family every piece of body text and every heading is
+/// drawn in, overriding the theme's `font-family` for them. `None` follows
+/// the theme. (Code keeps `pre.font`: a family that reads well as prose is
+/// rarely the one to read code in.)
+static DOC_FONT: RwLock<Option<&'static str>> = RwLock::new(None);
+
+pub fn set_doc_font(family: &str) { crate::fonts::store(&DOC_FONT, family) }
+
+/// The family `key` (`page.font`, `title.font`, `h1.font` …) is drawn in: the
+/// reader's choice for the document's text, else the theme's.
+pub fn doc_font(key: &str) -> &'static str { doc_font_in(active(), key) }
+
+/// `doc_font` for a theme that need not be the active one (外观's sample).
+pub fn doc_font_in(st: &Style, key: &str) -> &'static str { pick_font(*DOC_FONT.read().unwrap(), st, key) }
+
+fn pick_font(chosen: Option<&'static str>, st: &Style, key: &str) -> &'static str {
+    match chosen {
+        // The note's own text; code keeps `pre.font`, which is the theme's.
+        Some(family) if key.ends_with(".font") && key != "pre.font" => family,
+        _ => st.font(key),
+    }
+}
+
+/// 设置 › 正文字号: how many px the body text moves from the theme's
+/// `page.size` (0 follows the theme). Headings, the title, tables and code go
+/// by the same ratio, so a theme keeps its proportions. Callers scale through
+/// `doc_len`; `Style::num` stays the theme's own value (it is also what a
+/// duplicated theme writes out).
+static DOC_STEP: AtomicI32 = AtomicI32::new(0);
+
+/// The `Preferences::doc_size` choices and their step: 小 / 标准 / 大 / 特大,
+/// like 界面字号's −1 / +2 with one more step up.
+pub fn doc_step(pref: &str) -> i32 { match pref { "small" => -1, "large" => 2, "xlarge" => 4, _ => 0 } }
+/// The presets in 外观's order (小 / 标准 / 大 / 特大) as `doc_size` stores them.
+pub const DOC_PRESETS: [&str; 4] = ["small", "", "large", "xlarge"];
+/// A custom 正文字号's range, in pt.
+pub const DOC_MIN: f32 = 12.;
+pub const DOC_MAX: f32 = 24.;
+/// A custom 正文字号 (自定义): `doc_size` holds the size in pt ("17") where a preset holds its name.
+/// An older version reads the number as no preset, 标准, and carries on.
+pub fn custom_size(pref: &str) -> Option<f32> { pref.trim().parse::<f32>().ok().filter(|n| (DOC_MIN..=DOC_MAX).contains(n)).map(f32::round) }
+/// A custom 正文字号 in force, in pt (0: a preset, `DOC_STEP`).
+static DOC_ABS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub fn set_doc_size(pref: &str) {
+    let abs = custom_size(pref).unwrap_or(0.).to_bits();
+    let step = DOC_STEP.swap(doc_step(pref), Ordering::Relaxed) != doc_step(pref);
+    if step | (DOC_ABS.swap(abs, Ordering::Relaxed) != abs) { touch(); }
+}
+/// The body size `pref` gives in a theme whose own is `body`: a preset's step from it, or the custom size.
+pub fn doc_size_pt(pref: &str, body: f32) -> f32 { custom_size(pref).unwrap_or(body + doc_step(pref) as f32) }
+
+/// A type metric of the note (font size or line height) at the reader's
+/// 正文字号, for the active theme.
+pub fn doc_len(n: f32) -> f32 { doc_len_in(active(), n) }
+
+/// `doc_len` for a theme that need not be the active one (外观's sample).
+pub fn doc_len_in(st: &Style, n: f32) -> f32 {
+    let body = st.num("page.size");
+    // a custom size is absolute: its step is from this theme's body, so every theme lands on it
+    let abs = f32::from_bits(DOC_ABS.load(Ordering::Relaxed));
+    let step = if abs > 0. { (abs - body).round() as i32 } else { DOC_STEP.load(Ordering::Relaxed) };
+    scale_len(n, body, step)
+}
+
+/// Whole pixels keep baselines crisp; step 0 returns `n` untouched.
+fn scale_len(n: f32, body: f32, step: i32) -> f32 {
+    if step == 0 || body <= 0. { return n }
+    (n * (body + step as f32).max(1.) / body).round()
+}
 /// Bumped whenever what is drawn may change (the editor re-measures its rows).
 pub fn generation() -> u64 { GENERATION.load(Ordering::Relaxed) }
 /// Something every theme draws changed (light / dark).
@@ -317,7 +411,11 @@ pub fn touch() { GENERATION.fetch_add(1, Ordering::Relaxed); }
 pub fn themes() -> std::sync::RwLockReadGuard<'static, Vec<Theme>> { THEMES.read().unwrap() }
 /// Files that could not be read at all, from the last load.
 pub fn errors() -> Vec<String> { ERRORS.read().unwrap().clone() }
-pub fn dir() -> PathBuf { crate::store::Store::internal_dir().join("themes") }
+/// The themes folder: the top-level folder in front's (W21), else this computer's.
+pub fn dir() -> PathBuf {
+    let root = crate::store::Store::active_dir();
+    if root.join(crate::store::INTERNAL).exists() { crate::store::Store::themes_dir_of(&root) } else { crate::store::Store::settings_dir().join("themes") }
+}
 
 // ---- CSS
 
@@ -520,6 +618,11 @@ fn parse_with_fonts<'a>(css: &str, fonts: &mut dyn FnMut() -> &'a [String]) -> R
     let meta = Meta { name: var("--theme-name"), name_en: var("--theme-name-en"), author: var("--theme-author"), description: var("--theme-description") };
     let mut st = Style::plain(feishu);
     let mut warn = vec![];
+    // At-rules are skipped whole; a `@media (prefers-color-scheme: dark)` block is the one people
+    // write, and it never applies: the dark look is worked out from the light colours. Say so.
+    if css.contains("@media") {
+        warn.push(format!("@media … — {}", crate::settings::tr("深色效果由浅色配色推算，主题不能单独写深色值", "the dark look is worked out from the light colours; a theme can't set its own")));
+    }
     for (n, v) in &vars {
         let v = subst(v, &vars, 0);
         for kind in ["color", "background", "callout", "highlight", "border"] {
@@ -591,7 +694,7 @@ fn parse_with_fonts<'a>(css: &str, fonts: &mut dyn FnMut() -> &'a [String]) -> R
     };
     for (p, v) in &raw {
         let el = p.key.split('.').next().unwrap_or("");
-        let em = match el { "page" | "p" | "list" | "quote" | "task" | "code" | "callout" | "hr" | "strong" | "a" | "done" | "bullet" | "number" | "selection" | "th" => body, e => size_of(e) };
+        let em = match el { "page" | "p" | "list" | "quote" | "task" | "code" | "callout" | "hr" | "strong" | "em" | "a" | "done" | "bullet" | "number" | "selection" | "th" => body, e => size_of(e) };
         let unitless = (p.prop == "line-height").then_some(em);
         let val = match p.kind {
             Kind::Len => parse_len(v, if p.prop == "font-size" { body } else { em }, unitless).filter(|n| (0. ..2000.).contains(n)).map(Val::N),
@@ -653,16 +756,16 @@ pub fn load(selected: &str, all: bool, font_source: impl FnOnce() -> Vec<String>
     }
     let mut errors = vec![];
     let mut files: Vec<PathBuf> = if all {
-        std::fs::read_dir(dir()).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "css")).collect()).unwrap_or_default()
+        fdl_core::vfs::read_dir(dir()).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "css")).collect()).unwrap_or_default()
     } else if !selected.is_empty() && std::path::Path::new(selected).file_name().is_some_and(|n| n == selected) {
         vec![dir().join(format!("{selected}.css"))]
     } else { vec![] };
     files.sort();
     for p in files {
-        if !all && !p.exists() { continue; }
+        if !all && !p.fs_exists() { continue; }
         let id = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         let file = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        match std::fs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|t| parse_with_fonts(&t, &mut resolve_fonts).map(|parsed| (t, parsed))) {
+        match fdl_core::vfs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|t| parse_with_fonts(&t, &mut resolve_fonts).map(|parsed| (t, parsed))) {
             Ok((text, parsed)) => {
                 let bundled = BUNDLED.iter().find(|(b, _)| *b == id).map(|(_, css)| *css);
                 let t = theme_of(id.clone(), &text, Some(p), bundled, parsed);
@@ -678,8 +781,8 @@ pub fn load(selected: &str, all: bool, font_source: impl FnOnce() -> Vec<String>
         if let Ok(p) = parse(css, &[]) { list.push(theme_of(id.into(), css, None, Some(css), p)); }
         // Preserve the user's craft.css override when the selected theme disappeared.
         let p = dir().join("craft.css");
-        if selected != "craft" && p.exists() {
-            match std::fs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|t| parse_with_fonts(&t, &mut resolve_fonts).map(|parsed| (t, parsed))) {
+        if selected != "craft" && p.fs_exists() {
+            match fdl_core::vfs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|t| parse_with_fonts(&t, &mut resolve_fonts).map(|parsed| (t, parsed))) {
                 Ok((text, parsed)) => list[0] = theme_of(id.into(), &text, Some(p), Some(css), parsed),
                 Err(e) => errors.push(format!("craft.css: {e}")),
             }
@@ -702,8 +805,8 @@ pub fn select(id: &str) -> String {
 }
 
 /// Modification stamps of the user's theme files (live reload compares them).
-pub fn stamp() -> Vec<(PathBuf, std::time::SystemTime, u64)> {
-    let mut v: Vec<_> = std::fs::read_dir(dir()).map(|rd| rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "css"))
+pub fn stamp() -> Vec<(PathBuf, web_time::SystemTime, u64)> {
+    let mut v: Vec<_> = fdl_core::vfs::read_dir(dir()).map(|rd| rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "css"))
         .filter_map(|e| { let m = e.metadata().ok()?; Some((e.path(), m.modified().ok()?, m.len())) }).collect()).unwrap_or_default();
     v.sort();
     v
@@ -716,9 +819,9 @@ pub fn editable_file(id: &str) -> std::io::Result<PathBuf> {
     let t = list.iter().find(|t| t.id == id).ok_or_else(|| std::io::Error::other("no such theme"))?;
     if let Some(p) = &t.path { return Ok(p.clone()) }
     let d = dir();
-    std::fs::create_dir_all(&d)?;
+    fdl_core::vfs::create_dir_all(&d)?;
     let p = d.join(format!("{id}.css"));
-    std::fs::write(&p, t.bundled.unwrap_or_default())?;
+    fdl_core::vfs::write(&p, t.bundled.unwrap_or_default())?;
     Ok(p)
 }
 
@@ -726,11 +829,11 @@ pub fn editable_file(id: &str) -> std::io::Result<PathBuf> {
 pub fn duplicate(id: &str) -> std::io::Result<(String, PathBuf)> {
     let list = THEMES.read().unwrap();
     let t = list.iter().find(|t| t.id == id).ok_or_else(|| std::io::Error::other("no such theme"))?;
-    let src = match &t.path { Some(p) => std::fs::read_to_string(p)?, None => t.bundled.unwrap_or_default().to_string() };
+    let src = match &t.path { Some(p) => fdl_core::vfs::read_to_string(p)?, None => t.bundled.unwrap_or_default().to_string() };
     let d = dir();
-    std::fs::create_dir_all(&d)?;
+    fdl_core::vfs::create_dir_all(&d)?;
     let (new_id, p) = (1..).map(|n| { let s = if n == 1 { format!("{id}-copy") } else { format!("{id}-copy-{n}") }; let p = d.join(format!("{s}.css")); (s, p) })
-        .find(|(s, p)| !p.exists() && !BUNDLED.iter().any(|(b, _)| b == s)).unwrap();
+        .find(|(s, p)| !p.fs_exists() && !BUNDLED.iter().any(|(b, _)| b == s)).unwrap();
     let name = format!("{} {}", t.name, crate::settings::tr("副本", "copy"));
     let mut out = String::with_capacity(src.len());
     for line in src.lines() {
@@ -740,14 +843,14 @@ pub fn duplicate(id: &str) -> std::io::Result<(String, PathBuf)> {
         out.push_str(line);
         out.push('\n');
     }
-    std::fs::write(&p, out)?;
+    fdl_core::vfs::write(&p, out)?;
     Ok((new_id, p))
 }
 
 /// Drop the user's copy of a built-in theme (or delete a theme of their own).
 pub fn remove(id: &str) -> std::io::Result<()> {
     let p = THEMES.read().unwrap().iter().find(|t| t.id == id).and_then(|t| t.path.clone());
-    match p { Some(p) => std::fs::remove_file(p), None => Ok(()) }
+    match p { Some(p) => fdl_core::vfs::remove_file(p), None => Ok(()) }
 }
 
 // ---- writing a complete stylesheet
@@ -789,15 +892,15 @@ fn base_named(kind: &str, name: &str, feishu: bool) -> Option<Hsla> {
 #[cfg(test)]
 fn base_css(feishu: bool, name: &str, name_en: &str, description: &str) -> String {
     let st = Style::plain(feishu);
-    let mut out = format!("/*\n * quiet.md 文档主题：{name}\n *\n * 每个属性都写着当前的值。改完保存，应用里立即生效。\n * 选择器与属性的说明见 docs/THEMES.md。\n */\n\n:root {{\n");
-    out += &format!("  --theme-name: \"{name}\";\n  --theme-name-en: \"{name_en}\";\n  --theme-author: \"quiet.md\";\n  --theme-description: \"{description}\";\n  /* 块的画法：craft 或 feishu */\n  --theme-base: {};\n", if feishu { "feishu" } else { "craft" });
-    for (kind, title) in [("color", "文字颜色"), ("highlight", "文字高亮"), ("background", "块背景"), ("callout", "高亮块底色"), ("border", "高亮块边框")] {
+    let mut out = format!("/*\n * Quiet.md document theme: {name_en}\n *\n * Each property shows its current value. Save edits to see them immediately.\n * See docs/THEMES.md for selectors and properties.\n */\n\n:root {{\n");
+    out += &format!("  --theme-name: \"{name}\";\n  --theme-name-en: \"{name_en}\";\n  --theme-author: \"quiet.md\";\n  --theme-description: \"{description}\";\n  /* Block rendering style: craft or feishu */\n  --theme-base: {};\n", if feishu { "feishu" } else { "craft" });
+    for (kind, title) in [("color", "Text colors"), ("highlight", "Text highlights"), ("background", "Block backgrounds"), ("callout", "Callout fills"), ("border", "Callout borders")] {
         out += &format!("\n  /* {title} */\n");
         for n in palette_names(kind) {
             if let Some(c) = base_named(kind, n, feishu) { out += &format!("  --{kind}-{n}: {};\n", css_color(c)); }
         }
     }
-    out += "\n  /* 其它界面细节（文档内的选中、悬停、表格工具等） */\n";
+    out += "\n  /* Other document UI details (selection, hover, table tools, etc.) */\n";
     for (i, t) in TOKENS.iter().enumerate() {
         // Window material depends on the running OS, not the document theme.
         if *t != "window" && !RULE_TOKENS.contains(t) { out += &format!("  --token-{}: {};\n", t.replace('_', "-"), css_color(crate::editor_theme::base_color(i, feishu))); }
@@ -838,6 +941,40 @@ const FEISHU_DESCRIPTION: &str = "飞书文档的正文样式：16 / 26，标题
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn doc_size_presets_and_custom() {
+        // the presets keep their names (and an older library's values); a number is a custom size
+        for (pref, pt) in [("small", 15.), ("", 16.), ("large", 18.), ("xlarge", 20.), ("17", 17.), ("12", 12.), ("24", 24.)] {
+            assert_eq!(super::doc_size_pt(pref, 16.), pt, "{pref:?}");
+        }
+        assert_eq!(super::custom_size("small"), None);
+        assert_eq!(super::custom_size("30"), None);
+        assert_eq!(super::custom_size(" 18 "), Some(18.));
+    }
+
+    #[test]
+    fn document_size_scales_by_the_body_step() {
+        // Empty (and anything unknown) is the theme's size, untouched.
+        assert_eq!((doc_step(""), doc_step("huge")), (0, 0));
+        assert_eq!(scale_len(55.25, 16., 0), 55.25);
+        // craft: 15 → 14 / 17 / 19; headings and lines keep the ratio, in whole px.
+        assert_eq!([doc_step("small"), doc_step("large"), doc_step("xlarge")].map(|s| scale_len(15., 15., s)), [14., 17., 19.]);
+        assert_eq!(scale_len(22., 15., doc_step("large")), 25.);
+        assert_eq!(scale_len(28., 15., doc_step("xlarge")), 35.);
+        assert_eq!(scale_len(13., 16., doc_step("small")), 12.);
+    }
+
+    #[test]
+    fn document_font_covers_prose_not_code() {
+        let st = Style::plain(true);
+        for key in ["page.font", "title.font", "h1.font", "h6.font", "h9.font"] {
+            assert_eq!(pick_font(Some("Georgia"), &st, key), "Georgia", "{key}");
+            assert_eq!(pick_font(None, &st, key), st.font(key), "{key}");
+        }
+        assert_eq!(pick_font(Some("Georgia"), &st, "pre.font"), st.font("pre.font"));
+        assert_ne!(st.font("pre.font"), "Georgia");
+    }
+
     use super::*;
 
     #[test]
@@ -871,8 +1008,27 @@ mod tests {
     #[ignore]
     fn write_base_css() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/themes");
-        std::fs::write(format!("{dir}/craft.css"), base_css(false, "Craft", "Craft", CRAFT_DESCRIPTION)).unwrap();
-        std::fs::write(format!("{dir}/feishu.css"), base_css(true, "飞书", "Feishu", FEISHU_DESCRIPTION)).unwrap();
+        fdl_core::vfs::write(format!("{dir}/craft.css"), base_css(false, "Craft", "Craft", CRAFT_DESCRIPTION)).unwrap();
+        fdl_core::vfs::write(format!("{dir}/feishu.css"), base_css(true, "飞书", "Feishu", FEISHU_DESCRIPTION)).unwrap();
+    }
+
+    /// #255: text colours work on the feishu base too; left out, nothing changes.
+    #[test]
+    fn text_colors_on_either_base() {
+        for base in ["craft", "feishu"] {
+            let plain = parse(&format!(":root {{ --theme-base: {base}; }}"), &[]).unwrap().0;
+            assert!(["h1.color", "h6.color", "strong.color", "em.color", "code.color"].iter().all(|k| plain.color(k).is_none()), "{base}");
+            let css = format!(":root {{ --theme-base: {base}; }} h1 {{ color: #c00; }} h3 {{ color: #0c0; }} b {{ color: #00c; }} i {{ color: #c0c; }} code {{ color: #cc0; padding-left: 6px; border-radius: 2px; }}");
+            let (st, _, warn) = parse(&css, &[]).unwrap();
+            assert!(warn.is_empty(), "{base}: {warn:?}");
+            for (k, v) in [("h1.color", 0xcc0000), ("h3.color", 0x00cc00), ("strong.color", 0x0000cc), ("em.color", 0xcc00cc), ("code.color", 0xcccc00)] {
+                assert_eq!(st.color(k), Some(crate::theme::adapt(crate::theme::c(v))), "{base} {k}");
+            }
+            assert!(st.color("h2.color").is_none());
+            assert_eq!((st.num("code.pad"), st.num("code.radius")), (6., 2.));
+        }
+        // The feishu chip keeps its own default padding and radius.
+        assert_eq!((Style::plain(true).num("code.pad"), Style::plain(true).num("code.radius")), (2., 4.));
     }
 
     #[test]
@@ -901,7 +1057,9 @@ mod tests {
         assert_eq!((st.num("callout.pad-y"), st.num("callout.pad-x")), (16., 12.));
         assert!(st.palette("color", "red").is_some());
         assert!(st.tokens[TOKENS.iter().position(|t| *t == "block_hover").unwrap()].is_some());
-        assert_eq!(warn, vec![".made-up { color }".to_string()]);
+        assert_eq!(warn.len(), 2, "{warn:?}");
+        assert!(warn.iter().any(|w| w.starts_with("@media")), "{warn:?}");
+        assert!(warn.iter().any(|w| w == ".made-up { color }"), "{warn:?}");
     }
 
     #[test]

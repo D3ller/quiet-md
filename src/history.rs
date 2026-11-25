@@ -11,6 +11,7 @@ use crate::editor::core::Core;
 use crate::input::{TextField, TextFieldEvent};
 use crate::theme::{self, Theme};
 use crate::ui::{format_date, format_time};
+use crate::design::{Button, ButtonSize, Popover, Segment, Segmented, menu as dmenu};
 use fdl_core::changes::Change;
 use fdl_core::model::BlockId;
 use fdl_core::versions::Version;
@@ -113,7 +114,7 @@ impl Workspace {
             Some(name) => self.preview_version(&name, window, cx),
             None => {
                 self.preview = None;
-                window.focus(&self.focus);
+                window.focus(&self.focus, cx);
                 cx.notify();
             }
         }
@@ -148,6 +149,7 @@ impl Workspace {
         }
         if let Some(ed) = &self.editor {
             ed.update(cx, |e, cx| {
+                if e.table_file { e.reset_tables(); }
                 e.receive_document(&Core::new(doc), cx);
                 e.set_read_only(true, cx);
                 e.set_preview(true, cx);
@@ -171,6 +173,7 @@ impl Workspace {
         let Some(p) = self.preview.take() else { return };
         if let Some(ed) = &self.editor {
             ed.update(cx, |e, cx| {
+                if e.table_file { e.reset_tables(); }
                 e.receive_document(&p.core, cx);
                 e.diff_marks = None;
                 e.set_preview(false, cx);
@@ -281,8 +284,14 @@ impl Workspace {
         }
     }
 
+    fn is_table(&self, id: &str) -> bool { self.entries.iter().any(|e| e.id == id && e.meta.kind == crate::store::DocKind::Table) }
+
     pub fn restore_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((id, name)) = self.history.as_ref().and_then(|h| h.selected.clone().map(|n| (h.id.clone(), n))) else { return };
+        // a 数据表 writes as it is edited: nothing of the present may be pending when its file is replaced
+        let table = self.is_table(&id);
+        // a build without 数据表 leaves its file as it is
+        if table { if let Some(ed) = self.editor.clone() { ed.update(cx, |e, cx| e.commit_tables(cx)); } crate::table::flush_all(cx); }
         let doc = match self.store.restore_version(&id, &name) {
             Ok(d) => d,
             Err(e) => return self.set_history_error(e.to_string(), cx),
@@ -295,13 +304,14 @@ impl Workspace {
             self.show_toast_kind(crate::editor_ui::ToastKind::Error, crate::settings::tr("恢复失败：当前版本未被改动。", "Restore failed; the current version was left alone."), cx);
             return;
         }
+        if table && let Some(p) = self.store.file_path(&id) { crate::table::reload(&p, cx); }
         if let Some(ed) = &self.editor {
-            ed.update(cx, |e, cx| e.receive_document(&Core::new(doc), cx));
+            ed.update(cx, |e, cx| { if e.table_file { e.reset_tables(); } e.receive_document(&Core::new(doc), cx) });
         }
         self.unsaved = false;
         self.status = crate::app::SaveStatus::Saved;
         self.sync_document(window, cx);
-        self.entries = self.store.list();
+        self.entries.set(self.store.list());
         self.sort();
         self.show_toast_kind(crate::editor_ui::ToastKind::Success, crate::settings::tr("已恢复到所选版本", "Restored that version"), cx);
     }
@@ -309,6 +319,22 @@ impl Workspace {
     pub fn version_as_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((id, name)) = self.history.as_ref().and_then(|h| h.selected.clone().map(|n| (h.id.clone(), n))) else { return };
         let meta = self.history.as_ref().and_then(|h| h.versions.iter().find(|v| v.name == name)).map(|v| (v.label.clone(), v.ms));
+        if self.is_table(&id) {
+            let (label, ms) = meta.unwrap_or_default();
+            let tag = label.unwrap_or_else(|| match ms { 0 => String::new(), ms => hhmm(ms / 1000) });
+            let base = self.entries.iter().find(|e| e.id == id).map(|e| crate::settings::display_title(&e.title).to_string()).unwrap_or_default();
+            let title = if tag.is_empty() { base } else { crate::localized_format!("{}（{}）", "{} ({})", base, tag) };
+            match self.store.copy_table_version(&id, &name, &title) {
+                Ok(new) => {
+                    self.entries.set(self.store.list());
+                    self.sort();
+                    self.close_history(cx);
+                    self.open(&new, window, cx);
+                }
+                Err(e) => self.set_history_error(e.to_string(), cx),
+            }
+            return;
+        }
         match self.store.version_document(&id, &name) {
             Ok(mut doc) => {
                 // Name the copy after *which* snapshot it is: a bare "副本" or
@@ -320,7 +346,7 @@ impl Workspace {
                 doc.title = crate::model::RichText::plain(title);
                 match self.store.create_from(&doc) {
                     Ok(new) => {
-                        self.entries = self.store.list();
+                        self.entries.set(self.store.list());
                         self.sort();
                         self.close_history(cx);
                         self.open(&new, window, cx);
@@ -348,7 +374,7 @@ impl Workspace {
             f
         });
         let focus = field.focus_handle(cx);
-        window.focus(&focus);
+        window.focus(&focus, cx);
         let subs = vec![
             cx.subscribe_in(&field, window, |w, _, ev: &TextFieldEvent, window, cx| match ev {
                 TextFieldEvent::Submit => w.finish_version_rename(true, window, cx),
@@ -373,7 +399,7 @@ impl Workspace {
         if let Some(v) = self.history.as_mut().and_then(|h| h.versions.iter_mut().find(|v| v.name == r.name)) {
             v.label = label;
         }
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -396,7 +422,7 @@ impl Workspace {
         let has_marks = h.versions.iter().position(|x| x.name == p.name).is_some_and(|i| i + 1 < h.versions.len());
         let on = h.marks && has_marks;
         Some(
-            div().id("history-banner").flex_none().h(px(BANNER_H)).px(px(16.)).pr(px(DRAWER_W + 8.)).flex().items_center().gap(px(10.))
+            div().id("history-banner").flex_none().h(px(BANNER_H)).px(px(16.)).pr(px(DRAWER_W + 24.)).flex().items_center().gap(px(10.))
                 .bg(theme::ca(crate::theme::craft::O50, 0.6))
                 .border_b_1().border_color(Theme::line_divider())
                 .child(div().flex_none().text_size(px(12.)).text_color(Theme::text()).child(title))
@@ -404,21 +430,21 @@ impl Workspace {
                     .child(crate::localized_format!("+{} 行 −{} 行", "+{} −{} lines", added, removed)))
                 .child(div().flex_1())
                 .child(
-                    div().id("history-marks").flex_none().h(px(24.)).px(px(10.)).flex().items_center().rounded(px(6.))
-                        .when(on, |d| d.bg(Theme::primary_fill_1()).text_color(Theme::primary()))
-                        .when(!on, |d| d.text_color(Theme::text_caption()))
-                        .when(has_marks, |d| d.cursor_pointer().on_click(cx.listener(|w, _, _, cx| w.toggle_history_marks(cx))))
-                        .text_size(px(12.))
-                        .child(crate::settings::tr("显示改动", "Show changes")),
+                    Button::ghost("history-marks").selected(on).disabled(!has_marks)
+                        .when(has_marks, |d| d.on_click(cx.listener(|w, _, _, cx| w.toggle_history_marks(cx))))
+                        .label(crate::settings::tr("显示改动", "Show changes")),
                 )
-                .child(crate::ui::secondary_button("history-back", crate::settings::tr("返回当前", "Back to now"))
+                .child(Button::outline("history-back").sized(ButtonSize::Tool).label(crate::settings::tr("返回当前", "Back to now"))
                     .on_click(cx.listener(|w, _, _, cx| w.exit_preview(cx))))
-                .child(crate::ui::primary_button("history-restore", crate::settings::tr("恢复此版本", "Restore this version"))
+                .child(Button::primary("history-restore").sized(ButtonSize::Tool).label(crate::settings::tr("恢复此版本", "Restore this version"))
                     .on_click(cx.listener(|w, _, window, cx| w.restore_selected(window, cx))))
                 .into_any_element(),
         )
     }
 
+    /// The 版本历史 drawer: a floating card like the app's other panels (popover surface, 13pt text,
+    /// rows as menu rows). Header: title, count, 全部 / 已命名; then the versions by day; at the foot,
+    /// 保存当前版本 and, for the version being previewed, 另存副本 and 删除.
     pub(crate) fn render_history(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let h = self.history.as_ref()?;
         let selected = h.selected.clone();
@@ -431,8 +457,8 @@ impl Workspace {
             if day != Some(key) {
                 day = Some(key);
                 rows.push(
-                    div().flex_none().h(px(26.)).px(px(14.)).flex().items_end().pb(px(4.))
-                        .text_size(px(11.)).text_color(Theme::text_caption()).child(day_label(v.ms / 1000)).into_any_element(),
+                    div().flex_none().h(px(30.)).px(px(13.)).flex().items_end().pb(px(4.))
+                        .text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(Theme::text_caption()).child(day_label(v.ms / 1000)).into_any_element(),
                 );
             }
             let name = v.name.clone();
@@ -444,38 +470,27 @@ impl Workspace {
             let field = renaming.as_ref().filter(|(n, _)| n == &name).map(|(_, f)| f.clone());
             let click_name = name.clone();
             rows.push(
-                div().id(("history-row", i)).group(group.clone()).w_full().flex_none()
-                    .h(px(if label.is_some() { 46. } else { 38. }))
-                    .pl(px(12.)).pr(px(8.))
-                    .flex().flex_row().items_center().gap(px(10.))
-                    .border_l_2()
-                    .when(on, |d| d.border_color(Theme::primary()).bg(Theme::fill_hover()))
-                    .when(!on, |d| d.border_color(transparent_black()))
-                    .when(!editing, |d| d.cursor_pointer().hover(|s| s.bg(Theme::fill_hover())))
-                    .when(!editing, |d| d.on_click(cx.listener(move |w: &mut Workspace, _, window, cx| w.preview_version(&click_name, window, cx))))
+                div().id(("history-row", i)).group(group.clone()).flex_none().mx(px(dmenu::PAD))
+                    .h(px(if label.is_some() { 48. } else { 36. })).px(px(8.))
+                    .flex().flex_row().items_center().gap(px(10.)).rounded(px(crate::design::G.menu_row_r))
+                    .when(on, |d| d.bg(crate::design::color::accent()))
+                    .when(!editing && !on, |d| d.hover(|s| s.bg(Theme::fill_hover())))
+                    .when(!editing, |d| d.cursor_pointer().on_click(cx.listener(move |w: &mut Workspace, _, window, cx| w.preview_version(&click_name, window, cx))))
                     .when(editing, |d| d.bg(Theme::fill_hover()))
-                    .child(div().flex_none().w(px(36.)).text_size(px(12.)).text_color(if on { Theme::text() } else { Theme::text_caption() })
-                        .child(hhmm(v.ms / 1000)))
+                    .child(div().flex_none().w(px(40.)).text_size(px(13.)).text_color(crate::design::color::foreground())
+                        .when(on, |d| d.font_weight(FontWeight::MEDIUM)).child(hhmm(v.ms / 1000)))
                     .child(match field {
                         Some(field) => div().flex_1().min_w_0().child(field).into_any_element(),
                         None => div().flex_1().min_w_0().flex().flex_col().justify_center()
-                            .child(div().text_size(px(12.)).line_height(px(16.)).text_color(Theme::text())
-                                .overflow_hidden().whitespace_nowrap().text_ellipsis()
-                                .child(label.clone().unwrap_or_else(|| delta.clone())))
-                            .when(label.is_some(), |d| d.child(div().text_size(px(11.)).line_height(px(14.))
-                                .text_color(Theme::text_caption()).child(delta.clone())))
+                            .when_some(label.clone(), |d, l| d.child(div().text_size(px(13.)).line_height(px(20.)).font_weight(FontWeight::MEDIUM).text_color(Theme::text())
+                                .overflow_hidden().whitespace_nowrap().text_ellipsis().child(l)))
+                            .child(div().text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_caption())
+                                .overflow_hidden().whitespace_nowrap().text_ellipsis().child(delta.clone()))
                             .into_any_element(),
                     })
-                    .when(!editing && label.is_some(), |d| d.child(
-                        // 命名 markers stay subtle: a dot before the name.
-                        div().flex_none().w(px(4.)).h(px(4.)).rounded_full().bg(Theme::primary()),
-                    ))
                     .when(!editing, |d| d.child(
-                        div().id(("history-rename", i)).flex_none().h(px(22.)).px(px(6.)).flex().items_center().rounded(px(5.))
-                            .text_size(px(11.)).text_color(Theme::text_caption()).opacity(0.)
-                            .group_hover(group.clone(), |s| s.opacity(1.))
-                            .hover(|s| s.bg(Theme::fill_hover_strong()))
-                            .child(crate::settings::tr("命名", "Name"))
+                        Button::ghost(("history-rename", i)).sized(ButtonSize::Xs).icon("pen-line")
+                            .invisible().group_hover(group.clone(), |s| s.visible())
                             .on_click(cx.listener(move |w: &mut Workspace, _, window, cx| w.start_version_rename(&name, window, cx))),
                     ))
                     .into_any_element(),
@@ -483,65 +498,45 @@ impl Workspace {
         }
         let count = h.versions.iter().filter(|v| v.label.is_some()).count();
         let has_sel = selected.is_some();
-        let header = div().flex_none().h(px(44.)).px(px(14.)).flex().items_center().gap(px(8.))
-            .border_b_1().border_color(Theme::line_divider())
-            .child(div().flex_1().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(crate::settings::tr("版本历史", "Version history")))
-            .child(crate::trash::close_button("history-close")
-                .on_click(cx.listener(|w, _, _, cx| w.close_history(cx))));
-        let filter = div().flex_none().h(px(32.)).px(px(14.)).flex().items_center().gap(px(8.))
-            .border_b_1().border_color(Theme::line_divider())
-            .child(div().flex_1().text_size(px(11.)).text_color(Theme::text_caption())
-                .child(crate::localized_format!("{} 份 · 每份 5 分钟起", "{} kept · 5 min apart", h.versions.len())))
-            .child(
-                div().id("history-named").flex_none().h(px(22.)).px(px(8.)).flex().items_center().rounded(px(5.))
-                    .text_size(px(11.)).cursor_pointer()
-                    .when(h.named_only, |d| d.bg(Theme::primary_fill_1()).text_color(Theme::primary()))
-                    .when(!h.named_only, |d| d.text_color(Theme::text_caption()).hover(|s| s.bg(Theme::fill_hover())))
-                    .child(crate::localized_format!("仅看命名 ({})", "Named ({})", count))
-                    .on_click(cx.listener(|w, _, _, cx| w.toggle_history_named(cx))),
-            );
-        let list = div().id("history-list").flex_1().min_h_0().overflow_y_scroll().track_scroll(&h.list_scroll)
-            .flex().flex_col().py(px(6.))
-            .when(visible.is_empty(), |d| d.child(
-                div().px(px(20.)).py(px(28.)).text_size(px(12.)).line_height(px(19.)).text_color(Theme::text_caption())
-                    .child(if h.versions.is_empty() {
-                        crate::settings::tr("还没有历史版本。继续编辑，保存时会自动记录。", "No versions yet. They are recorded as you edit.")
-                    } else {
-                        crate::settings::tr("还没有命名版本。把鼠标移到某一版上，点「命名」。", "Nothing named yet. Hover a version and choose Name.")
-                    })))
-            .children(rows);
-        let footer = div().flex_none().border_t_1().border_color(Theme::line_divider()).px(px(14.)).py(px(10.)).flex().flex_col().gap(px(6.))
-            .child(crate::ui::secondary_button("history-snapshot", crate::settings::tr("保存当前版本", "Save a version"))
-                .w_full()
+        // 全部 / 已命名: a segmented control
+        let tab = |id: &'static str, text: String, on: bool| Segment::new(id, text).selected(on);
+        let header = div().flex_none().pt(px(14.)).pb(px(8.)).px(px(14.)).flex().flex_col().gap(px(10.))
+            .child(div().flex().items_center().gap(px(8.))
+                .child(div().flex_1().text_size(px(15.)).line_height(px(22.)).font_weight(FontWeight::SEMIBOLD).child(crate::settings::tr("版本历史", "Version history")))
+                .child(Button::ghost("history-close").sized(ButtonSize::Xs).icon("x").on_click(cx.listener(|w, _, _, cx| w.close_history(cx)))))
+            .child(Segmented::new()
+                .child(tab("history-all", crate::localized_format!("全部 {}", "All {}", h.versions.len()), !h.named_only)
+                    .on_click(cx.listener(|w, _, _, cx| if w.history.as_ref().is_some_and(|h| h.named_only) { w.toggle_history_named(cx) })))
+                .child(tab("history-named", crate::localized_format!("已命名 {}", "Named {}", count), h.named_only)
+                    .on_click(cx.listener(|w, _, _, cx| if w.history.as_ref().is_some_and(|h| !h.named_only) { w.toggle_history_named(cx) }))));
+        let empty = |title: &'static str, hint: &'static str| div().flex_1().flex().flex_col().items_center().justify_center().gap(px(6.)).px(px(28.)).pb(px(40.))
+            .child(crate::ui::icon("restore", 28., Theme::text_placeholder()))
+            .child(div().mt(px(4.)).text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(Theme::text()).child(title))
+            .child(div().text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_caption()).text_center().child(hint));
+        let list = if visible.is_empty() {
+            if h.versions.is_empty() {
+                empty(crate::settings::tr("还没有历史版本", "No versions yet"), crate::settings::tr("编辑时每 5 分钟自动保存一份；保留的份数在 设置 › 文档库 里调。", "A version is kept every 5 minutes as you edit. How many are kept is in Settings › Library."))
+            } else {
+                empty(crate::settings::tr("还没有命名版本", "Nothing named yet"), crate::settings::tr("把鼠标移到某一版上，点铅笔给它起个名字。", "Hover a version and click the pencil to name it."))
+            }.into_any_element()
+        } else {
+            crate::design::scroll::make_room(div().id("history-list").flex_1().min_h_0().overflow_y_scroll().track_scroll(&h.list_scroll).flex().flex_col().pb(px(6.)), "history-list", dmenu::PAD).children(rows).child(crate::design::scroll::bar_corners("history-list", &h.list_scroll, 0., crate::design::scroll::WINDOW_R)).into_any_element()
+        };
+        let act = |id: &'static str, text: &'static str| Button::ghost(id).label(text);
+        let footer = div().flex_none().border_t_1().border_color(Theme::line_divider()).p(px(12.)).flex().items_center().gap(px(4.))
+            .child(Button::outline("history-snapshot").sized(ButtonSize::Tool).label(crate::settings::tr("保存当前版本", "Save a version"))
                 .on_click(cx.listener(|w, _, window, cx| w.save_version_now(window, cx))))
-            .child(div().flex().items_center().gap(px(14.))
-                // These act on the version being previewed: dim them when
-                // there is none (the drawer is open on an empty list, or the
-                // user is back on the live document).
-                .child(div().id("history-copy").flex_none().text_size(px(11.))
-                    .text_color(Theme::text_caption()).when(!has_sel, |d| d.opacity(0.4))
-                    .when(has_sel, |d| d.cursor_pointer().hover(|s| s.text_color(Theme::text())))
-                    .child(crate::settings::tr("另存副本", "Save as copy"))
-                    .when(has_sel, |d| d.on_click(cx.listener(|w, _, window, cx| w.version_as_copy(window, cx)))))
-                .child(div().id("history-delete").flex_none().text_size(px(11.))
-                    .text_color(Theme::text_caption()).when(!has_sel, |d| d.opacity(0.4))
-                    .when(has_sel, |d| d.cursor_pointer().hover(|s| s.text_color(Theme::danger())))
-                    .child(crate::settings::tr("删除此版本", "Delete version"))
-                    .when(has_sel, |d| d.on_click(cx.listener(|w, _, window, cx| w.delete_selected_version(window, cx)))))
-                .child(div().flex_1())
-                .child(div().text_size(px(11.)).text_color(Theme::text_caption())
-                    .child(crate::settings::tr("设置 › 文档库可调份数", "Count in Settings"))));
+            .child(div().flex_1())
+            // these act on the version being previewed: shown only while there is one
+            .when(has_sel, |d| d
+                .child(act("history-copy", crate::settings::tr("另存副本", "Save as copy")).on_click(cx.listener(|w, _, window, cx| w.version_as_copy(window, cx))))
+                .child(Button::destructive("history-delete").sized(ButtonSize::Tool).label(crate::settings::tr("删除", "Delete"))
+                    .on_click(cx.listener(|w, _, window, cx| w.delete_selected_version(window, cx)))));
         Some(
-            div().id("history-drawer").absolute().top(px(HEADER_H)).right_0().bottom_0().w(px(DRAWER_W))
-                .flex().flex_col()
-                .bg(crate::theme::raised(Theme::bg_body()))
-                .border_l_1().border_color(Theme::line_divider())
-                .shadow(theme::shadow_panel())
-                .occlude()
+            Popover::new("history-drawer").absolute().top(px(HEADER_H + 8.)).right(px(8.)).bottom(px(8.)).w(px(DRAWER_W))
+                .flex().flex_col().overflow_hidden()
                 .child(header)
-                .child(filter)
-                .children(h.error.clone().map(|e| div().flex_none().px(px(14.)).py(px(8.))
-                    .text_size(px(11.)).line_height(px(16.)).text_color(Theme::danger()).child(e)))
+                .children(h.error.clone().map(|e| div().flex_none().mx(px(14.)).mb(px(6.)).text_size(px(12.)).line_height(px(18.)).text_color(Theme::danger()).child(e)))
                 .child(list)
                 .child(footer)
                 .into_any_element(),

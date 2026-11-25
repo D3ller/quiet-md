@@ -34,7 +34,8 @@ b</code></pre></td></tr></tbody></table>
 <p></p>
 "#;
 
-const TEXTS: &[&str] = &["a", "中文", "😀", " ", "ab cd", "é", "👍🏽", "x"];
+const TEXTS: &[&str] = &["a", "中文", "😀", " ", "ab cd", "é", "👍🏽", "x", "汉a字1", "かな"];
+const MARKERS: &[&str] = &["# ", "＃＃ ", "- ", "—— ", "1. ", "2． ", "> ", "＞ ", "| ", "[] ", "``` ", "```rust", "···py", "*** "];
 const PASTES: &[&str] = &["一\n二", "a\n\nb\nc", "\n", "😀\n中", "line"];
 
 struct Rng(u64);
@@ -93,7 +94,7 @@ fn random_kind(rng: &mut Rng) -> BlockKind {
         3 => BlockKind::Ordered { seq: None },
         4 => BlockKind::Todo { done: false },
         5 => BlockKind::Quote,
-        _ => BlockKind::Code { lang: "plaintext".into(), caption: None, wrap: false },
+        _ => BlockKind::Code { lang: "plaintext".into(), caption: None, wrap: false, show_code: false },
     }
 }
 
@@ -120,10 +121,12 @@ fn step(c: &mut Core, rng: &mut Rng) -> String {
     }
     let us = c.units();
     let any = |rng: &mut Rng| rng.pick(&us).id;
-    match rng.below(24) {
+    match rng.below(27) {
         0..=2 => {
             let s = *rng.pick(TEXTS);
             c.insert_text(s);
+            // 中英文之间自动加空格, as typing does with it on.
+            if rng.chance(30) && c.space_typed(s.len()) { return format!("insert_text({s:?})+space_typed"); }
             format!("insert_text({s:?})")
         }
         3 => {
@@ -131,8 +134,9 @@ fn step(c: &mut Core, rng: &mut Rng) -> String {
             "enter".into()
         }
         4 | 5 => {
+            c.backspace_to_title = rng.below(2) == 0;
             c.backspace();
-            "backspace".into()
+            format!("backspace(to_title: {})", c.backspace_to_title)
         }
         6 => {
             c.delete_forward();
@@ -202,6 +206,11 @@ fn step(c: &mut Core, rng: &mut Rng) -> String {
         }
         18 => {
             let id = any(rng);
+            if let Some(b) = c.block(id).filter(|b| matches!(b.kind, BlockKind::Code { .. })) {
+                let f = !b.folded;
+                c.set_code_folded(id, f);
+                return format!("set_code_folded({id:?}, {f})");
+            }
             if c.can_fold(id) {
                 c.toggle_fold(id);
             }
@@ -216,12 +225,50 @@ fn step(c: &mut Core, rng: &mut Rng) -> String {
         20 if rng.chance(20) => board_step(c, rng),
         20 => table_step(c, rng),
         21 => object_step(c, rng),
+        26 => {
+            let (image, target) = (any(rng), any(rng));
+            let before = rng.chance(50);
+            c.move_image_beside(image, target, before);
+            format!("move_image_beside({image:?}, {target:?}, {before})")
+        }
         22 => {
             if c.sel.head.block != TITLE && !c.is_code(c.sel.head.block) {
                 let images = parse("<title></title><img src=\"screenshot.png\"/><p></p>").unwrap();
                 c.paste_blocks(images.blocks);
             }
             "paste_image".into()
+        }
+        23 => {
+            // A line-start Markdown marker typed as the editor view does it.
+            let s = *rng.pick(MARKERS);
+            if rng.chance(50) && c.text_of(c.sel.head.block).is_some() {
+                c.sel = Selection::caret(Pos::new(c.sel.head.block, 0));
+            }
+            c.insert_text(s);
+            if s.ends_with(' ') {
+                let _ = c.markdown_block_shortcut() || c.markdown_divider();
+            } else if !c.markdown_enter_shortcut() {
+                c.enter();
+            }
+            format!("markdown({s:?})")
+        }
+        // A miss on the chance guard falls through to trailing_line below.
+        24 if rng.chance(15) => format!("space_document = {}", c.space_document()),
+        25 if rng.chance(40) => {
+            // `$x$` typed delimiters first (#69), then the caret leaves it.
+            let d = *rng.pick(&["$$", "$$$$"]);
+            c.insert_text(d);
+            let h = c.sel.head;
+            if c.sel.is_collapsed() && h.offset >= d.len() / 2 && c.text_of(h.block).is_some_and(|t| t.text[..h.offset].ends_with(d)) {
+                c.sel = Selection::caret(Pos::new(h.block, h.offset - d.len() / 2));
+            }
+            for ch in ["x", "^", "2"] {
+                c.insert_text(ch);
+                c.markdown_inline_shortcut();
+                c.equation_on_leave();
+            }
+            random_selection(c, rng);
+            format!("equation_on_leave({d:?}) = {}", c.equation_on_leave())
         }
         _ => {
             c.trailing_line();
@@ -320,7 +367,17 @@ fn table_step(c: &mut Core, rng: &mut Rng) -> String {
     let (nr, nc) = (t.rows.len(), t.ncols());
     let slot = |rng: &mut Rng| (rng.below(nr), rng.below(nc));
     let kind = *rng.pick(&[CellSelKind::Range, CellSelKind::Rows, CellSelKind::Cols]);
-    let s = CellSel { table, anchor: slot(rng), head: slot(rng), kind };
+    let mut s = CellSel { table, anchor: slot(rng), head: slot(rng), kind };
+    // Or one cell, as Shift+↑/↓ past its first / last text block selects it.
+    if rng.chance(25) {
+        let (r, col) = t.origin(rng.below(nr), rng.below(nc));
+        let mut ids = vec![];
+        super::table_ops::text_blocks(&t.rows[r][col].blocks, &mut ids);
+        let down = rng.chance(50);
+        if let Some(one) = (if down { ids.last() } else { ids.first() }).and_then(|id| c.cell_edge_sel(*id, down)) {
+            s = one;
+        }
+    }
     c.select_cells(s);
     let what = match rng.below(7) {
         0 => {
@@ -359,7 +416,7 @@ fn table_step(c: &mut Core, rng: &mut Rng) -> String {
 /// Inline objects: insert one at the caret, or edit the one under it.
 fn object_step(c: &mut Core, rng: &mut Rng) -> String {
     let p = c.sel.head;
-    match rng.below(5) {
+    match rng.below(6) {
         0 => {
             c.insert_equation(rng.pick(&["x^2", "a<b", ""]));
             "insert_equation".into()
@@ -375,6 +432,10 @@ fn object_step(c: &mut Core, rng: &mut Rng) -> String {
         3 => {
             c.insert_doc_link(&InlineDocLink { id: "doc1".into(), title: "文档 & <一>".into() });
             "insert_doc_link".into()
+        }
+        4 => {
+            let at = c.selection_to_equation();
+            format!("selection_to_equation -> {at:?}")
         }
         _ => {
             c.set_equation_source(p, rng.pick(&["y", "\\frac{1}{2}", "x^2"]));
@@ -563,6 +624,9 @@ fn unfolded(doc: &Document) -> String {
         for b in blocks {
             b.folded = false;
             walk(&mut b.children);
+            if let BlockKind::Table(t) = &mut b.kind {
+                t.rows.iter_mut().flatten().for_each(|cell| walk(&mut cell.blocks));
+            }
         }
     }
     let mut doc = doc.clone();

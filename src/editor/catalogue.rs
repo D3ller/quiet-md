@@ -5,7 +5,7 @@ use super::core::TITLE;
 use super::render::{TOP, flattens, visible_with_gaps};
 use super::view::{Editor, EditorEvent};
 use crate::model::*;
-use crate::feishu_theme::{self as theme, Theme, craft};
+use crate::feishu_theme::{self as theme, Theme};
 use crate::editor_ui::{TipExt, TipSide, icon, ui_text};
 use gpui::{prelude::FluentBuilder, *};
 use std::cell::Cell;
@@ -292,24 +292,12 @@ impl Editor {
         }
         let floating = mode == CatMode::Forced;
         let pinned = self.cat_pinned;
-        let pin = div()
-            .id(SharedString::from(format!("cat-pin-{pinned}")))
+        let pin = crate::design::Button::ghost(SharedString::from(format!("cat-pin-{pinned}")))
+            .sized(crate::design::ButtonSize::Xs)
             .absolute()
             .left(px(14.))
             .top(px(10.))
-            .size(px(24.))
-            .rounded(px(4.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .group("cat-pin")
-            .hover(|s| s.bg(Theme::fill_hover_strong()))
-            .active(|s| s.bg(theme::ta(31, 35, 41, 0.2)))
-            .child(
-                icon(if pinned { "catalogue-collapse" } else { "catalogue-list" }, 18., Theme::icon())
-                    .group_hover("cat-pin", |s| s.text_color(theme::c(craft::old::B500))),
-            )
+            .child(icon(if pinned { "catalogue-collapse" } else { "catalogue-list" }, 16., crate::design::color::muted_foreground()))
             .tip_label(if pinned { crate::settings::text("收起目录") } else { crate::settings::text("展开目录") }.into(), TipSide::Above)
             .on_click(cx.listener(move |ed, _, _, cx| ed.set_cat_pinned(!pinned, cx)));
 
@@ -372,10 +360,12 @@ impl Editor {
         let collapsed = self.cat_collapsed.clone();
         let text_w = width - 11.;
         let mut style = window.text_style();
-        style.font_family = theme::UI_FONT.into();
+        style.font_family = theme::ui_family().into();
         let entity = cx.entity();
         let n = rows.len();
         let rows = Rc::new(rows);
+        let h = (n as f32 * ROW_H + 22.).min(max_h.max(ROW_H));
+        let scrolls = n as f32 * ROW_H + 22. > h;
         let list = uniform_list("catalogue-list", n, move |range, window, _| {
             range
                 .map(|ix| {
@@ -450,11 +440,14 @@ impl Editor {
                 })
                 .collect()
         })
-        .track_scroll(self.cat_scroll.clone())
+        .track_scroll(&self.cat_scroll)
         .w(px(width - 11.))
-        .h(px((n as f32 * ROW_H + 22.).min(max_h.max(ROW_H))))
-        .pb(px(22.));
-        div().w(px(width)).child(list).into_any_element()
+        .h(px(h))
+        // A list that scrolls ends 44 below its last row: GPUI 0.2's
+        // uniform_list counted the bottom padding twice.
+        .pb(px(if scrolls { 44. } else { 22. }));
+        // A list that scrolls keeps the wheel: the page under it stays put.
+        div().w(px(width)).when(scrolls, |d| d.on_scroll(|_, _, cx| cx.stop_propagation())).child(list).into_any_element()
     }
 }
 

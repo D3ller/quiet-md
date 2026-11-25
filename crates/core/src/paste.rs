@@ -256,6 +256,12 @@ pub fn link_ok(h: &str) -> bool {
     ["http://", "https://", "mailto:", "ftp://"].iter().any(|p| l.starts_with(p))
 }
 
+/// Relative Markdown file references, including fragments on the current page.
+pub fn relative_link(s: &str) -> bool {
+    !s.is_empty() && !s.contains([':', '\\']) && !s.starts_with('/') && !s.chars().any(char::is_control)
+        && (s.starts_with(['.', '#']) || s.contains('/') || s.split('#').next().and_then(|p| std::path::Path::new(p).extension()).is_some())
+}
+
 fn container(n: &Handle, ctx: &Ctx, out: &mut Vec<Block>) {
     let mut para = RichText::default();
     for c in n.children.borrow().iter() {
@@ -544,7 +550,7 @@ fn code(pre: &Handle) -> Block {
     let text = text.replace("\r\n", "\n");
     let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
     let lang = code_lang(pre).map_or(crate::lang::from_token(""), |l| crate::lang::resolve(&l).to_string());
-    Block::new(BlockKind::Code { lang, caption: None, wrap: false }, RichText::plain(text))
+    Block::new(BlockKind::Code { lang, caption: None, wrap: false, show_code: false }, RichText::plain(text))
 }
 
 /// Language from `language-x` / `lang-x` / `highlight-source-x` classes or a
@@ -977,6 +983,13 @@ fn md_blocks(lines: &[&str], off: Off, mut spans: Option<&mut Vec<(usize, usize)
         }
         let ind = indent_of(line);
         let body = line.trim();
+        // An empty paragraph, as Markdown files are written (`markdown::BLANK`).
+        if body == crate::markdown::BLANK {
+            out.push(Block::text(""));
+            last_list = false;
+            i += 1;
+            continue;
+        }
         if let Some((b, n)) = display_math(&lines[i..]) {
             out.push(b);
             i += n;
@@ -999,7 +1012,7 @@ fn md_blocks(lines: &[&str], off: Off, mut spans: Option<&mut Vec<(usize, usize)
                 j += 1;
             }
             let lang = crate::lang::resolve(info.split_whitespace().next().unwrap_or("")).to_string();
-            out.push(Block::new(BlockKind::Code { lang, caption: None, wrap: false }, RichText::plain(code.join("\n"))));
+            out.push(Block::new(BlockKind::Code { lang, caption: None, wrap: false, show_code: false }, RichText::plain(code.join("\n"))));
             i = j + 1;
             last_list = false;
             continue;
@@ -1082,10 +1095,10 @@ fn md_blocks(lines: &[&str], off: Off, mut spans: Option<&mut Vec<(usize, usize)
             i += n;
             continue;
         }
-        if let Some((alt, src)) = image_line(body).filter(|_| off.file) {
-            let caption = (off.alt && !alt.is_empty()).then(|| md_inline(alt).text);
+        if off.file && let Some((alt, src, width)) = image_line(body).map(|(a, s)| (md_inline(a).text, s.to_string(), None)).or_else(|| html_image_line(body)) {
+            let caption = (off.alt && !alt.is_empty()).then_some(alt);
             let mut b = Block::new(
-                BlockKind::Image { src_kind: "src".into(), src: src.to_string(), width: None, height: None, caption, crop: None },
+                BlockKind::Image { src_kind: "src".into(), src, width, height: None, caption, crop: None },
                 RichText::default(),
             );
             b.align = crate::model::Align::Center;
@@ -1108,6 +1121,20 @@ fn image_line(s: &str) -> Option<(&str, &str)> {
     let src = inner.split_once([' ', '\t']).map_or(inner, |(a, _)| a);
     let src = src.trim_start_matches('<').trim_end_matches('>');
     (!src.is_empty() && !inner.contains(')')).then_some((alt, src))
+}
+
+/// `<img src="…" alt="…" width="…">` filling the whole line, as GitHub
+/// READMEs and some editors write a picture: its alt, src and width in px
+/// (`auto`, percentages and the height are left to the picture itself).
+fn html_image_line(s: &str) -> Option<(String, String, Option<f32>)> {
+    if !s.get(..4)?.eq_ignore_ascii_case("<img") || !s.ends_with('>') { return None; }
+    let dom = html5ever::parse_document(RcDom::default(), Default::default()).from_utf8().read_from(&mut s.as_bytes()).ok()?;
+    let body = find(&dom.document, "body")?;
+    let kids = body.children.borrow();
+    let [img] = &kids[..] else { return None };
+    if tag(img).as_deref() != Some("img") { return None; }
+    let src = attr(img, "src")?.trim().to_string();
+    (!src.is_empty()).then(|| (attr(img, "alt").unwrap_or_default().trim().to_string(), src, width_px(img)))
 }
 
 /// A quote that is really a callout: GitHub's / Obsidian's `[!NOTE] Title`
@@ -1234,7 +1261,7 @@ fn pipe_table(lines: &[&str]) -> Option<(Block, usize)> {
 }
 
 /// Initial Markdown widths; saved DocxXML widths and manual resizing stay intact.
-fn pipe_table_widths(rows: &[Vec<TableCell>], ncols: usize) -> Vec<f32> {
+pub(crate) fn pipe_table_widths(rows: &[Vec<TableCell>], ncols: usize) -> Vec<f32> {
     use unicode_width::UnicodeWidthStr;
     let mut widths = vec![Table::MIN_WIDTH; ncols];
     for row in rows {
@@ -1289,8 +1316,20 @@ pub fn is_numeric_math(src: &str) -> bool {
 }
 
 /// Inline Markdown: code spans, equations, links, bare URLs and the emphasis
-/// rules of the live shortcuts (`~x~` is underline). Paste turns escapes,
+/// rules of the live shortcuts (`~x~` is underline), and paired `<u>…</u>`
+/// (how Markdown export writes underline; no other HTML). Paste turns escapes,
 /// images and `<…>` autolinks off.
+/// A numeric character reference at the start of `s` (`&#32;`, `&#xA0;`):
+/// the character and the reference's length.
+pub(crate) fn char_ref(s: &str) -> Option<(char, usize)> {
+    let body = s.strip_prefix("&#")?;
+    let (hex, digits) = match body.strip_prefix(['x', 'X']) { Some(h) => (true, h), None => (false, body) };
+    let n = digits.bytes().take_while(|b| if hex { b.is_ascii_hexdigit() } else { b.is_ascii_digit() }).count();
+    if n == 0 || n > if hex { 6 } else { 7 } || digits.as_bytes().get(n) != Some(&b';') { return None; }
+    let ch = char::from_u32(u32::from_str_radix(&digits[..n], if hex { 16 } else { 10 }).ok()?).filter(|&c| c != '\0')?;
+    Some((ch, s.len() - digits.len() + n + 1))
+}
+
 pub fn md_inline(s: &str) -> RichText {
     let mut out = RichText::default();
     let mut plain = String::new();
@@ -1310,6 +1349,18 @@ pub fn md_inline(s: &str) -> RichText {
         if c == '\\' && let Some(next) = rest[1..].chars().next().filter(char::is_ascii_punctuation) {
             plain.push(next);
             i += 1 + next.len_utf8();
+            continue;
+        }
+        // `<br>`, a line break inside the block, and `&#32;`, a character
+        // (a space a line would lose), as Markdown files are written.
+        if c == '<' && let Some(t) = ["<br>", "<br/>", "<br />"].into_iter().find(|t| rest.get(..t.len()).is_some_and(|r| r.eq_ignore_ascii_case(t))) {
+            plain.push('\n');
+            i += t.len();
+            continue;
+        }
+        if c == '&' && let Some((ch, n)) = char_ref(rest) {
+            plain.push(ch);
+            i += n;
             continue;
         }
         // Code span.
@@ -1356,7 +1407,29 @@ pub fn md_inline(s: &str) -> RichText {
                 continue;
             }
         }
+        if let Some(body) = rest.strip_prefix("![[") && let Some((inner, _)) = body.split_once("]]")
+            && !inner.contains(['[', ']', '\n']) {
+            let end = inner.len() + 5;
+            plain.push_str(&rest[..end]);
+            i += end;
+            continue;
+        }
+        if c == '[' && prev != Some('!') && let Some((inside, _)) = rest.strip_prefix("[[").and_then(|s| s.split_once("]]"))
+            && !inside.contains(['[', ']', '\n']) {
+            let (target, label) = inside.split_once('|').unwrap_or((inside, inside));
+            if !target.trim().is_empty() && !label.is_empty() {
+                flush(&mut plain, &mut out);
+                out.push(label, Marks { link: Some(format!("quiet-wiki:{inside}")), ..Default::default() });
+                i += inside.len() + 4;
+                continue;
+            }
+        }
         // Links `[text](url)`.
+        if c == '!' && rest.starts_with("![") && let Some((_, _, used)) = link_at(&rest[1..]) {
+            plain.push_str(&rest[..used + 1]);
+            i += used + 1;
+            continue;
+        }
         if c == '[' {
             let open = 0;
             if let Some((label, url, used)) = link_at(&rest[open..]) {
@@ -1399,6 +1472,15 @@ pub fn md_inline(s: &str) -> RichText {
                     continue;
                 }
             }
+        }
+        if let Some(body) = rest.strip_prefix("<u>") && let Some(end) = find_u_close(body).filter(|&e| e > 0) {
+            flush(&mut plain, &mut out);
+            let mut t = md_inline(&body[..end]);
+            let len = t.len();
+            t.update_marks(0..len, |m| m.underline = true);
+            out.append(&t);
+            i += 3 + end + 4;
+            continue;
         }
         // `＊强调＊` / `＊＊加粗＊＊`: only a closed pair is emphasis; a lone `＊` stays itself.
         if c == '＊' {
@@ -1463,6 +1545,31 @@ pub fn md_inline(s: &str) -> RichText {
     out
 }
 
+/// Offset of the `</u>` closing an opened `<u>`: nested pairs count, escapes
+/// and code spans are skipped (a tag inside code is text).
+fn find_u_close(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut i = 0;
+    while i < s.len() {
+        let rest = &s[i..];
+        if rest.starts_with('\\') && rest[1..].starts_with(|c: char| c.is_ascii_punctuation()) { i += 2; continue; }
+        if rest.starts_with('`') {
+            let n = rest.bytes().take_while(|&b| b == b'`').count();
+            i += find_run(&rest[n..], &rest[..n], b'`').map_or(n, |end| n + end + n);
+            continue;
+        }
+        if rest.starts_with("<u>") { depth += 1; i += 3; continue; }
+        if rest.starts_with("</u>") {
+            if depth == 0 { return Some(i); }
+            depth -= 1;
+            i += 4;
+            continue;
+        }
+        i += rest.chars().next().unwrap().len_utf8();
+    }
+    None
+}
+
 /// `find_run` for a run of `＊` (not part of a longer one), non-empty match only.
 fn find_wide_run(s: &str, delim: &str) -> Option<usize> {
     let mut from = 0;
@@ -1521,8 +1628,8 @@ fn link_at(s: &str) -> Option<(&str, &str, usize)> {
     let inner = rest.strip_prefix('(')?;
     let end = inner.find(')')?;
     let target = inner[..end].trim();
-    let url = target.split_whitespace().next().unwrap_or("").trim_matches(['<', '>']);
-    if url.is_empty() || !(link_ok(url) || url.starts_with("www.")) {
+    let url = if let Some(inner) = target.strip_prefix('<').and_then(|s| s.split_once('>')) { inner.0 } else { target.split_whitespace().next().unwrap_or("").trim_matches(['<', '>']) };
+    if url.is_empty() || !(link_ok(url) || relative_link(url) || url.starts_with("www.")) {
         return None;
     }
     Some((&s[1..close], url, close + 1 + 1 + end + 1))
@@ -1636,6 +1743,25 @@ mod tests {
     }
 
     #[test]
+    fn markdown_underline_tags() {
+        let under = |s: &str| { let t = super::md_inline(s); t.spans().filter(|(_, m)| m.underline).map(|(r, _)| t.text[r].to_string()).collect::<Vec<_>>().join("|") };
+        assert_eq!(under("a <u>b</u> c"), "b");
+        assert_eq!(under("<u>a <u>b</u> c</u>"), "a b c");
+        assert_eq!(under("<u>a `</u>` b</u>"), "a |</u>| b");
+        // Unpaired, empty, escaped or other tags stay text.
+        for s in ["a <u>b", "b</u> c", "<u></u>", "\\<u>b\\</u>", "<U>b</U>", "<b>x</b>", "`<u>b</u>`"] {
+            assert_eq!(under(s), "", "{s}");
+        }
+        assert_eq!(super::md_inline("a <u>b").text, "a <u>b");
+        assert_eq!(super::md_inline("\\<u>b\\</u>").text, "<u>b</u>");
+        // Opening a Markdown file and pasting read it the same.
+        for off in [super::Off::default(), super::Off { file: true, ..Default::default() }] {
+            let b = super::markdown_to_blocks("# <u>t</u>\n\n- <u>x</u>\n", off);
+            assert!(b.iter().all(|b| b.text.spans().all(|(_, m)| m.underline)), "{b:?}");
+        }
+    }
+
+    #[test]
     fn markdown_display_math() {
         for (src, equation) in [
             ("$$V = I R$$", "V = I R"),
@@ -1684,6 +1810,26 @@ mod tests {
         let t = super::md_inline("Total: $x / 2$; tax($7$) not math, matrix $a \\\\ b$ is.");
         let equations: Vec<_> = t.spans().filter_map(|(_, m)| m.inline.as_ref().and_then(|i| i.equation().map(str::to_string))).collect();
         assert_eq!(equations, vec!["x / 2", "a \\\\ b"]);
+    }
+
+    #[test]
+    fn markdown_html_images() {
+        use crate::model::BlockKind;
+        let off = super::Off { file: true, alt: true, ..Default::default() };
+        let img = |line: &str| match super::markdown_to_blocks(line, off).as_slice() {
+            [b] => match &b.kind { BlockKind::Image { src, width, caption, .. } => Some((src.clone(), *width, caption.clone())), _ => None },
+            _ => None,
+        };
+        assert_eq!(img(r#"<img src="https://file.oss/image.png" alt="" width="auto" height="auto" >"#), Some(("https://file.oss/image.png".into(), None, None)));
+        assert_eq!(img(r#"<IMG SRC='img/a b.png' alt="Cat" width="300" />"#), Some(("img/a b.png".into(), Some(300.), Some("Cat".into()))));
+        assert_eq!(img(r#"<img src="a.png" style="width: 120px" height="50%">"#), Some(("a.png".into(), Some(120.), None)));
+        assert_eq!(img(r#"<img src="https://x.y/a.png?a=1&amp;b=2">"#).map(|i| i.0), Some("https://x.y/a.png?a=1&b=2".into()));
+        // Anything else on the line, or no src: not a picture.
+        for line in [r#"<img src="a.png"> and text"#, r#"<img alt="x">"#, r#"<img src="">"#, "<imgx src=\"a.png\">", r#"<img src="a.png"><img src="b.png">"#] {
+            assert_eq!(img(line), None, "{line}");
+        }
+        // Pasting keeps it as text, as with `![](…)`.
+        assert!(matches!(super::markdown_to_blocks(r#"<img src="a.png">"#, super::Off::default())[0].kind, BlockKind::Text));
     }
 
     #[test]

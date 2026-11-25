@@ -42,22 +42,13 @@ impl R<'_> {
         // under the open board the thumbnail isn't seen: don't paint it every frame
         let covered = self.ed.boards.open.as_ref().is_some_and(|o| o.0 == id);
         let thumb = canvas(|_, _, _| {}, move |bounds, _, window, cx| if !covered { paint_fit(&mut painter.borrow_mut(), &board, bounds, PAD, window, cx) }).absolute().size_full();
-        let open_btn = div()
-            .id(("board-open", id.0))
+        let open_btn = crate::design::Button::outline(("board-open", id.0))
+            .sized(crate::design::ButtonSize::Tool)
             .absolute().top(px(10.)).right(px(10.))
-            .h(px(28.)).px(px(10.))
-            .flex().items_center().gap(px(4.))
-            .rounded(px(6.))
-            .bg(crate::theme::raised(Theme::bg_body()))
-            .border_1().border_color(Theme::line_border())
-            .shadow(crate::theme::shadow_button())
-            .text_size(px(13.)).text_color(Theme::text())
-            .cursor_pointer()
             .invisible()
             .group_hover(group.clone(), |s| s.visible())
-            .hover(|s| s.bg(Theme::fill_hover()))
-            .child(crate::ui::icon("whiteboard", 14., Theme::icon()))
-            .child(crate::settings::label("编辑"))
+            .icon("whiteboard")
+            .label(crate::settings::label("编辑"))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |e, _, window, cx| e.open_board(id, window, cx)));
         div()
@@ -103,11 +94,17 @@ impl Editor {
                     e.changed_preserving_viewport(window, cx);
                 }
             }
+            // the window's toast (the document's isn't drawn over the board),
+            // once this editor is no longer being updated (the workspace clears its toast)
+            BoardEvent::Toast(msg) => {
+                let (ws, msg) = (window.root::<crate::app::Workspace>().flatten(), msg.clone());
+                cx.defer(move |cx| { if let Some(ws) = ws { ws.update(cx, |ws, cx| ws.show_toast_kind(crate::editor_ui::ToastKind::Info, &msg, cx)); } });
+            }
         });
         self.boards.saved_once = false;
         self.menu = None;
         self.slash = None;
-        view.update(cx, |v, _| v.focus(window));
+        view.update(cx, |v, cx| v.focus(window, cx));
         self.boards.open = Some((id, view, sub));
         cx.notify();
     }
@@ -130,9 +127,34 @@ impl Editor {
         if self.board_file {
             cx.emit(EditorEvent::Leave);
         } else {
-            window.focus(&self.focus);
+            window.focus(&self.focus, cx);
         }
         cx.notify();
+    }
+
+    /// The open board is in the middle of something (a drag, a text): a
+    /// change from outside waits.
+    pub fn board_busy(&self, cx: &App) -> bool { self.boards.open.as_ref().is_some_and(|o| o.1.read(cx).busy()) }
+
+    /// The document was replaced (a change from outside, 重新载入, a sibling
+    /// window's edit): the open board follows its block, keeping where it
+    /// looks. `at`: the open board's place among the old document's boards,
+    /// for when the block's id changed with the reading.
+    pub(super) fn follow_open_board(&mut self, at: Option<usize>, cx: &mut Context<Self>) {
+        let Some((id, view, _)) = &mut self.boards.open else { return };
+        let boards = self.core.units().iter().filter_map(|u| match self.core.block(u.id).map(|b| &b.kind) { Some(BlockKind::Board(bd)) => Some((u.id, bd.clone())), _ => None }).collect::<Vec<_>>();
+        let found = boards.iter().find(|b| b.0 == *id).or_else(|| at.and_then(|i| boards.get(i))).cloned();
+        match found {
+            Some((now, bd)) => { *id = now; view.update(cx, |v, cx| v.reload(&bd, cx)); }
+            // its block is gone: back to the document (a standalone file always has its board)
+            None => self.boards.open = None,
+        }
+    }
+
+    /// The open board's place among the document's boards.
+    pub(super) fn open_board_at(&self) -> Option<usize> {
+        let (id, ..) = self.boards.open.as_ref()?;
+        self.core.units().iter().filter(|u| matches!(self.core.block(u.id).map(|b| &b.kind), Some(BlockKind::Board(_)))).position(|u| u.id == *id)
     }
 
     /// A board is open (in place of the document).

@@ -4,19 +4,33 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::prelude::*;
-use gpui::{div, px, relative, AnyElement, ClickEvent, FontWeight, Window, App};
+use gpui::{div, linear_color_stop, linear_gradient, px, relative, AnyElement, ClickEvent, FontWeight, ScrollHandle, Window, App};
 
+use crate::design::{Button, ButtonSize, Card};
 use crate::theme::Theme;
-use crate::ui::icon;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const RADIUS: f32 = 12.;
 /// 0.1.11's first note; a library moved this launch says it with its counts instead.
 const REAL_FOLDERS: &str = "文档库改为真实文件夹，以标题命名，和侧栏一致";
 
 /// Each version's notes: (version, [(中文, English)]). Only the running
 /// version's are shown; a version without notes shows nothing.
 const NOTES: &[(&str, &[(&str, &str)])] = &[
+    ("0.1.14", &[
+        ("查找替换支持正则表达式", "Find and replace supports regular expressions"),
+        ("Obsidian 的 [[双链]] 可以点击打开对应的笔记", "Obsidian [[wikilinks]] open the note they point to"),
+        ("新增土耳其语界面，阿拉伯语从右往左排版", "Turkish interface; Arabic lays out right to left"),
+        ("设置里可以选择界面字体和文档字体", "Choose the interface and document fonts in Settings"),
+        ("文档字体可选霞鹜文楷和朱雀仿宋，选中时才下载；画板的手写字体也在第一次用到时下载", "LXGW WenKai and Zhuque Fangsong can be the document font, downloaded when you pick them; the board's handwriting font downloads the first time a board needs it"),
+        ("字体列表按类别分组，可以搜索，悬停即预览，支持收藏和最近使用", "Font lists are grouped by kind, searchable, preview on hover, and keep favorites and recent picks"),
+        ("设置 › 文档库可以清理没有笔记用到的图片和文件", "Settings › Documents clears out images and files no note uses"),
+        ("新增「退格键回到标题」开关（设置 › 通用）", "New setting: Backspace returns to title (Settings › General)"),
+        ("文档很多时搜索不再卡顿，批量删除和清空回收站更快", "Search keeps up with large libraries; deleting many notes and emptying the Trash are faster"),
+        ("Windows 和 Linux：复制为 Markdown 改为 Ctrl+Shift+M", "Windows and Linux: Copy as Markdown is now Ctrl+Shift+M"),
+        ("「…」菜单直接列出全部选项，阅读模式和显示引用列表改为开关", "The … menu lists every item directly; Reading mode and Show references are switches"),
+        ("画板支持触控板双指缩放；窗口变窄时收起的侧栏，放宽后自动展开", "Pinch to zoom boards on a trackpad; a sidebar hidden by a narrow window comes back when it widens"),
+        ("修复切换文档卡顿、代码块折叠不保存、画板选背景色时崩溃和深色模式下按钮看不清", "Fix lag when switching documents, code block folds not saving, a crash in the board's background picker, and hard-to-read buttons in dark mode"),
+    ]),
     ("0.1.13", &[
         ("画板：在文档里插入，或直接打开 .excalidraw 文件", "Boards: add one to a note, or open .excalidraw files"),
         ("版本历史：「…」›「版本历史」查看以前保存的版本", "Version history: … › Version history shows earlier saves"),
@@ -122,32 +136,57 @@ pub fn startup(existed: bool) {
 /// The card, while it has not been closed: this version's notes, and the
 /// move to real folders when it happened this launch.
 pub fn card(on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Option<AnyElement> {
+    // the site's live demo is not an update anyone installed
+    if cfg!(target_family = "wasm") { return None }
     let notes = notes().filter(|_| PENDING.load(Ordering::Relaxed));
     let moved = *MIGRATED.lock().unwrap();
     if notes.is_none() && moved.is_none() { return None }
     let title: String = if notes.is_some() { crate::localized_format!("已更新到 {}", "Updated to {}", VERSION) } else { crate::settings::tr("文档库已改为真实文件夹", "Your library now uses real folders").into() };
-    let line = |text: String| div().w_full().min_w_0().flex().gap(px(6.)).text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_caption())
+    // the notes are the card's body: in the dark `muted-foreground` (#a3a3a3, about 6:1 on the card)
+    // rather than the caption grey, which sank to 3.7:1 there
+    let body = if crate::theme::dark() { crate::design::color::muted_foreground() } else { Theme::text_caption() };
+    let line = |text: String| div().w_full().min_w_0().flex().gap(px(6.)).text_size(px(12.)).line_height(px(18.)).text_color(body)
         .child(div().flex_none().child("·")).child(div().flex_1().min_w_0().child(text));
-    let mut list = div().mt(px(6.)).w_full().min_w_0().flex().flex_col().gap(px(4.));
+    // Padding, not margin: the scroll area's extent leaves a child's margin
+    // out, so scrolled to the end the last line lost its bottom 6pt.
+    let mut list = div().pt(px(6.)).w_full().min_w_0().flex().flex_col().gap(px(4.));
     if let Some((docs, folders)) = moved {
         let s = |n: usize| if n == 1 { "" } else { "s" };
-        list = list.child(line(crate::settings::localized(crate::settings::lang(), "文档库改为真实文件夹：访达里看到的就是侧栏，文件以标题命名（{docs} 篇文档、{folders} 个文件夹）",
-            || format!("文档库改为真实文件夹：访达里看到的就是侧栏，文件以标题命名（{docs} 篇文档、{folders} 个文件夹）"),
-            || format!("The library now uses real folders: Finder shows what the sidebar shows, files named by title ({docs} document{}, {folders} folder{})", s(docs), s(folders)))));
+        let lang = crate::settings::lang();
+        let text = if cfg!(target_os = "macos") {
+            crate::settings::localized(lang, "文档库改为真实文件夹：访达里看到的就是侧栏，文件以标题命名（{docs} 篇文档、{folders} 个文件夹）",
+                || format!("文档库改为真实文件夹：访达里看到的就是侧栏，文件以标题命名（{docs} 篇文档、{folders} 个文件夹）"),
+                || format!("The library now uses real folders: Finder shows what the sidebar shows, files named by title ({docs} document{}, {folders} folder{})", s(docs), s(folders)))
+        } else if cfg!(target_os = "windows") {
+            crate::settings::localized(lang, "文档库改为真实文件夹：文件资源管理器里看到的就是侧栏，文件以标题命名（{docs} 篇文档、{folders} 个文件夹）",
+                || format!("文档库改为真实文件夹：文件资源管理器里看到的就是侧栏，文件以标题命名（{docs} 篇文档、{folders} 个文件夹）"),
+                || format!("The library now uses real folders: File Explorer shows what the sidebar shows, files named by title ({docs} document{}, {folders} folder{})", s(docs), s(folders)))
+        } else {
+            crate::settings::localized(lang, "文档库改为真实文件夹：文件管理器里看到的就是侧栏，文件以标题命名（{docs} 篇文档、{folders} 个文件夹）",
+                || format!("文档库改为真实文件夹：文件管理器里看到的就是侧栏，文件以标题命名（{docs} 篇文档、{folders} 个文件夹）"),
+                || format!("The library now uses real folders: your file manager shows what the sidebar shows, files named by title ({docs} document{}, {folders} folder{})", s(docs), s(folders)))
+        };
+        list = list.child(line(text));
     }
     for &(zh, en) in notes.unwrap_or_default() {
         if moved.is_some() && zh == REAL_FOLDERS { continue }
         list = list.child(line(crate::settings::tr(zh, en).into()));
     }
-    // A continuous-corner white surface; the faint shadow follows its radius.
-    // At most half the sidebar; a longer list scrolls inside the card.
-    Some(crate::ui::continuous_surface(RADIUS, Theme::bg_body()).id("changelog").flex_none().max_h(relative(0.5)).flex().flex_col().min_w_0().overflow_hidden().mx(px(crate::sidebar::SB_X - 4.)).mb(px(2.)).pl(px(12.)).pr(px(6.)).pt(px(8.)).pb(px(10.))
-        .rounded(px(RADIUS)).shadow(crate::theme::shadow_card())
+    // The list's scroll position, kept between frames: the fade below shows while more is under it.
+    thread_local! { static SCROLL: ScrollHandle = ScrollHandle::new(); }
+    let scroll = SCROLL.with(|h| h.clone());
+    let more = scroll.max_offset().y > px(0.5) && scroll.offset().y > -scroll.max_offset().y + px(0.5);
+    let face = crate::design::color::card();
+    // A card; at most half the sidebar, a longer list scrolls inside it.
+    Some(Card::new("changelog").flex_none().max_h(relative(0.5)).min_w_0().overflow_hidden().mx(px(crate::sidebar::SB_X - 4.)).mb(px(2.)).pl(px(12.)).pr(px(6.)).pt(px(8.)).pb(px(10.))
         .child(div().flex_none().w_full().min_w_0().flex().items_center().justify_between()
             .child(div().text_size(px(13.)).line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).child(title))
-            .child(div().id("changelog-close").size(px(20.)).flex().items_center().justify_center().rounded(px(6.)).cursor_pointer()
-                .hover(|s| s.bg(Theme::fill_hover())).child(icon("x", 12., Theme::icon()))
+            .child(Button::ghost("changelog-close").icon("x").sized(ButtonSize::Xs)
                 .on_click(move |e, w, cx| { PENDING.store(false, Ordering::Relaxed); *MIGRATED.lock().unwrap() = None; on_close(e, w, cx); })))
-        .child(div().id("changelog-list").flex_1().min_h_0().overflow_y_scroll().child(list))
+        .child(div().relative().flex_1().min_h_0().flex().flex_col()
+            .child(crate::design::scroll::make_room(div().id("changelog-list").flex_1().min_h_0().overflow_y_scroll().track_scroll(&scroll), "changelog-list", 0.).child(list).child(crate::design::scroll::bar("changelog-list", &scroll, 0.)))
+            // A line cut by the card's bottom edge fades out instead; gone once the list is at its end.
+            .when(more, |d| d.child(div().absolute().left_0().right_0().bottom_0().h(px(24.))
+                .bg(linear_gradient(180., linear_color_stop(face.opacity(0.), 0.), linear_color_stop(face, 1.))))))
         .into_any_element())
 }

@@ -2,18 +2,19 @@
 //! Deleted pages wait in the library's `trash/` for 30 days; each row is a
 //! deleted page together with the child pages that went with it.
 
-use crate::app::{Confirm, Workspace};
+use crate::app::{Confirm, ConfirmCancel, ConfirmOk, Workspace};
 use crate::settings::display_title;
 use crate::search::doc_icon;
 use crate::store::{TRASH_DAYS, TrashEntry};
-pub(crate) use crate::ui::{close_button, dialog, list_header_text, list_line, menu_label, primary_button, row_hover, scrim, secondary_button};
-use crate::theme::{self, Theme, craft};
-use crate::ui::{ROW_RADIUS, TipExt, TitleBarExt, icon, popover, ui_para, ui_text};
+pub(crate) use crate::ui::{ToastKind, list_header_text, row_hover, row_line};
+use crate::design::{Button, ButtonSize, Checkbox, Dialog};
+use crate::theme::{self, Theme};
+use crate::ui::{ROW_RADIUS, TipExt, TitleBarExt, icon, ui_text};
 use gpui::{prelude::FluentBuilder, *};
 
 pub const TRASH_MENU_W: f32 = 160.;
 
-struct ListedTrash { trash: Vec<TrashEntry>, warnings: Vec<String> }
+struct ListedTrash { lists: Vec<(String, Vec<TrashEntry>)>, warnings: Vec<String> }
 struct PurgedTrash { errors: Vec<String> }
 
 /// 剩余时间: whole days left before the automatic 彻底删除.
@@ -45,21 +46,12 @@ pub(crate) fn page_header_with(ws: &Workspace, title: impl IntoElement, left: f3
         .when(!ws.sidebar_open && cfg!(target_os = "windows"), |d| d.child(div().mr(px(12.)).child(ws.header_navigation(cx))))
         .when(!ws.sidebar_open && !cfg!(target_os = "windows"), |d| {
             d.child(
-                div()
-                    .id("open-sidebar")
+                Button::ghost("open-sidebar")
                     .no_drag()
-                    .flex_none()
                     .ml(px(4.))
                     .mr(px(12.))
-                    .size(px(28.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(8.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(Theme::fill_hover_strong()))
+                    .icon("panel-left-open")
                     .tip(crate::settings::tr("展开侧栏", "Show sidebar"), Some(crate::shortcuts::hint("workspace::ToggleSidebar", "⌘ + ]")))
-                    .child(icon("panel-left-open", 17., Theme::icon()))
                     .on_click(cx.listener(|w, _, _, cx| {
                         w.sidebar_open = true;
                         cx.notify();
@@ -71,6 +63,16 @@ pub(crate) fn page_header_with(ws: &Workspace, title: impl IntoElement, left: f3
 }
 
 /// Centred empty-state illustration and caption.
+/// An illustration in the app's look: `illus/dark/…` beside `illus/…` holds the dark one (light greys
+/// mirrored to deep ones), so a white bin doesn't glow on a dark page.
+pub(crate) fn illus_for(path: &'static str) -> SharedString {
+    if crate::theme::dark() && let Some(name) = path.strip_prefix("illus/") {
+        let dark = format!("illus/dark/{name}");
+        if crate::assets::get(&dark).is_some() { return dark.into() }
+    }
+    path.into()
+}
+
 pub(crate) fn empty_state(illus: &'static str, text: &'static str) -> Div {
     div()
         .flex_1()
@@ -79,7 +81,7 @@ pub(crate) fn empty_state(illus: &'static str, text: &'static str) -> Div {
         .items_center()
         .justify_center()
         .pb(px(64.))
-        .child(img(illus).size(px(120.)))
+        .child(img(illus_for(illus)).size(px(120.)))
         .child(div().mt(px(16.)).text_size(px(13.)).line_height(px(20.)).text_color(Theme::text_caption()).child(text))
 }
 
@@ -94,10 +96,7 @@ impl Workspace {
 
     pub(crate) fn render_trash(&mut self, cx: &mut Context<Self>) -> AnyElement {
         // 清空回收站: a labelled button, only when there is something to empty.
-        let empty = (!self.trash.is_empty()).then(|| div().id("trash-empty").no_drag().flex_none().mr(px(8.)).h(px(28.)).px(px(10.)).flex().items_center().gap(px(6.))
-            .rounded(px(9.)).cursor_pointer().hover(|s| s.bg(Theme::fill_hover())).active(|s| s.bg(Theme::fill_pressed()))
-            .text_size(px(13.)).line_height(px(20.)).text_color(Theme::text())
-            .child(icon("bin", 14., Theme::icon())).child(crate::settings::text("清空回收站"))
+        let empty = (!self.trash.is_empty()).then(|| Button::ghost("trash-empty").no_drag().mr(px(8.)).icon("bin").label(crate::settings::text("清空回收站"))
             .on_click(cx.listener(|w, _, _, cx| { w.trash_menu = None; w.confirm = Some(Confirm::EmptyTrash); cx.notify(); })));
         let header = page_header(self, "回收站", 26., cx).children(empty).child(
             crate::ui::header_icon("trash-search", "search")
@@ -120,6 +119,11 @@ impl Workspace {
                 .text_color(list_header_text())
                 .child(crate::settings::label(label))
         };
+        // A row is lit while hovered or holding its menu; the lines touching it hide.
+        let lit = |i: usize| self.trash.get(i).is_some_and(|t| {
+            self.home.list_hover.as_ref().is_some_and(|h| *h == format!("trash-row-{}", t.id))
+                || self.trash_menu.as_ref().is_some_and(|(m, _, _)| *m == t.id)
+        });
         let table_header = div()
             .h(px(33.))
             .flex_none()
@@ -127,7 +131,7 @@ impl Workspace {
             .flex()
             .items_center()
             .border_b_1()
-            .border_color(list_line())
+            .border_color(row_line(lit(0)))
             .child(col(None, "标题"))
             .child(col(Some(168.), "位置"))
             .child(col(Some(168.), "剩余时间"))
@@ -137,36 +141,37 @@ impl Workspace {
             let (id, id2) = (t.id.clone(), t.id.clone());
             let menu_open = self.trash_menu.as_ref().is_some_and(|(m, _, _)| *m == t.id);
             let title = display_title(&t.title);
-            let more = div()
-                .id(SharedString::from(format!("trash-more-{}", t.id)))
-                .size(px(24.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.))
-                .cursor_pointer()
-                .hover(|s| s.bg(Theme::fill_hover_strong()))
-                .when(menu_open, |d| d.bg(Theme::fill_hover_strong()))
-                .child(icon("ellipsis", 16., Theme::icon()))
-                .on_click(cx.listener(move |w, ev: &ClickEvent, _, cx| {
+            let slot = format!("trash-more-{}", t.id);
+            let (record, lookup, slot2) = (self.more_bounds.clone(), self.more_bounds.clone(), slot.clone());
+            let more = Button::ghost(SharedString::from(slot.clone()))
+                .sized(ButtonSize::Xs)
+                .icon("ellipsis")
+                .selected(menu_open)
+                .relative()
+                .child(canvas(move |b, _, _| { record.borrow_mut().insert(slot.clone(), b); }, |_, _, _, _| {}).absolute().inset_0())
+                .on_click(cx.listener(move |w, _: &ClickEvent, _, cx| {
                     cx.stop_propagation();
-                    let p = ev.position();
-                    w.trash_menu = Some((id.clone(), point(p.x + px(12.), p.y + px(14.)), Corner::TopRight));
+                    // hung from the measured button, never the pointer
+                    let Some(b) = lookup.borrow().get(&slot2).copied() else { return };
+                    let (pos, corner) = crate::design::hang(b, crate::design::Align::End, None);
+                    w.trash_menu = Some((id.clone(), pos, corner));
                     cx.notify();
                 }));
+            let key = SharedString::from(format!("trash-row-{}", t.id));
             list = list.child(
                 div()
-                    .id(SharedString::from(format!("trash-row-{}", t.id)))
+                    .id(key.clone())
                     .h(px(56.))
                     .flex()
                     .items_center()
-                    .when(i > 0, |d| d.border_t_1().border_color(list_line()))
+                    .when(i > 0, |d| d.border_t_1().border_color(row_line(lit(i - 1) || lit(i))))
                     .hover(row_hover)
-                    .when(menu_open, |d| d.bg(Theme::fill_hover()).border_color(transparent_black()).rounded(px(ROW_RADIUS)))
+                    .on_hover(cx.listener(move |w, on: &bool, _, cx| if w.home.hover_row(&key, *on) { cx.notify() }))
+                    .when(menu_open, |d| d.bg(Theme::fill_hover()).rounded(px(ROW_RADIUS)))
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |w, ev: &MouseDownEvent, _, cx| {
-                            w.trash_menu = Some((id2.clone(), ev.position, Corner::TopLeft));
+                            w.trash_menu = Some((id2.clone(), ev.position, Anchor::TopLeft));
                             cx.notify();
                         }),
                     )
@@ -191,7 +196,7 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .gap(px(4.))
-                            .child(icon("library", 16., Theme::icon()))
+                            .child(icon("folder", 16., Theme::icon()))
                             .child(div().min_w_0().text_size(px(13.)).text_color(Theme::text_caption()).overflow_hidden().whitespace_nowrap().text_ellipsis().child(ui_text(self.trash_location(t)))),
                     )
                     .child(div().w(px(168.)).flex_none().pl(px(20.)).text_size(px(13.)).text_color(Theme::text_caption()).child(remaining(t.deleted)))
@@ -204,44 +209,35 @@ impl Workspace {
 
     pub(crate) fn render_trash_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (id, pos, corner) = self.trash_menu.clone()?;
-        // The context menu: 32pt rows on the quiet hover fill.
-        let item = |key: &'static str, ic: &'static str, label: &'static str, color: Hsla| {
-            let g = SharedString::from(key);
-            crate::ui::menu_row(key, g.clone())
-                .text_color(color)
-                .child(icon(ic, 16., if color == Theme::icon() { Theme::icon() } else { color }))
-                .child(menu_label(label, g, gpui::white()))
-        };
+        let item = |key: &'static str, ic: &'static str, label: &'static str, danger: bool| crate::design::MenuItem::new(key).icon(ic).label(crate::settings::label(label)).destructive(danger);
         let (a, b) = (id.clone(), id);
-        let menu = popover()
-            .id("trash-menu")
-            .occlude()
+        let menu = crate::design::Popover::new("trash-menu")
+            .menu()
             // At least TRASH_MENU_W, wider when a label needs it (English
             // "Delete permanently" ran into the edge).
             .min_w(px(TRASH_MENU_W))
-            .py(px(crate::ui::MENU_PAD_Y))
             .on_mouse_down_out(cx.listener(|w, _, _, cx| {
                 w.trash_menu = None;
                 cx.notify();
             }))
-            .child(item("tm-restore", "restore", crate::settings::text("恢复"), Theme::text()).on_click(cx.listener(move |w, _, _, cx| {
+            .child(item("tm-restore", "restore", crate::settings::text("恢复"), false).on_click(cx.listener(move |w, _, _, cx| {
                 w.trash_menu = None;
                 w.confirm = Some(Confirm::Restore(a.clone()));
                 cx.notify();
             })))
-            .child(item("tm-purge", "bin", crate::settings::text("彻底删除"), Theme::danger()).on_click(cx.listener(move |w, _, _, cx| {
+            .child(item("tm-purge", "bin", crate::settings::text("彻底删除"), true).on_click(cx.listener(move |w, _, _, cx| {
                 w.trash_menu = None;
                 w.confirm = Some(Confirm::Purge(b.clone()));
                 cx.notify();
             })));
         Some(
-            deferred(anchored().anchor(corner).position(pos).snap_to_window_with_margin(px(8.)).child(menu))
+            deferred(anchored().anchor(corner).position(pos).snap_to_window_with_margin(px(8.)).child(menu.fit(crate::design::room(pos, corner))))
                 .with_priority(2)
                 .into_any_element(),
         )
     }
 
-    fn restore_doc(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(crate) fn restore_doc(&mut self, id: &str, cx: &mut Context<Self>) {
         let file_before = self.store.track_file_changes();
         match self.store.restore(id) {
             Ok(moved) => {
@@ -254,7 +250,7 @@ impl Workspace {
                 self.status = crate::app::SaveStatus::Failed(msg);
             }
         }
-        self.entries = self.store.list();
+        self.entries.set(self.store.list());
         self.sort();
         self.sync_sub_pages(cx);
         self.trash = self.store.list_trash();
@@ -275,30 +271,39 @@ impl Workspace {
     }
 
     fn purge_trash(&mut self, ids: Vec<String>, success: &'static str, cx: &mut Context<Self>) {
-        if self.store.file_task_busy() || self.file_history.busy || self.tree_writes_pending() || ids.is_empty() { return; }
+        if self.store.file_task_busy() || self.file_history.busy || ids.is_empty() { return; }
+        let later = ids.clone();
+        if self.after_tree_writes(move |w, _, cx| w.purge_trash(later, success, cx)) { return; }
         let Some(task_guard) = self.store.begin_file_task() else { return };
-        let mut writer = self.store.tree_writer();
-        let task = cx.background_executor().spawn(async move {
-            let batch = writer.begin_batch().is_ok();
-            let mut errors = vec![];
-            let mut result: anyhow::Result<()> = Ok(());
-            for id in ids {
-                result = writer.purge(&id);
-                if result.is_err() { break }
+        // Each top-level folder's 回收站 is its own: one writer, and one write, per top-level folder.
+        let mut writers: Vec<(String, crate::store::Store, Vec<String>)> = vec![];
+        for id in &ids {
+            let Some(key) = self.store.trash_top(id) else { continue };
+            match writers.iter_mut().find(|(k, _, _)| *k == key) {
+                Some((_, _, v)) => v.push(id.clone()),
+                None => if let Some(w) = self.store.top_writer(&key) { writers.push((key, w, vec![id.clone()])); },
             }
-            if let Err(e) = result { errors.push(e.to_string()); }
-            if batch && let Err(e) = writer.end_batch() { errors.push(e.to_string()); }
-            let warnings = writer.take_warnings();
-            let trash = writer.list_trash();
-            (PurgedTrash { errors }, ListedTrash { trash, warnings })
+        }
+        let task = cx.background_executor().spawn(async move {
+            let (mut errors, mut lists, mut warnings) = (vec![], vec![], vec![]);
+            for (key, mut writer, gone) in writers {
+                // The 回收站's index is written once, not once a page.
+                errors.extend(writer.purge_many(&gone).err().map(|e| e.to_string()));
+                warnings.extend(writer.take_warnings());
+                lists.push((key, writer.list_trash()));
+            }
+            (PurgedTrash { errors }, ListedTrash { lists, warnings })
         });
+        // The rows go now; the 回收站 read back afterwards replaces this.
+        let ids: std::collections::HashSet<String> = ids.into_iter().collect();
+        self.trash.retain(|t| !ids.contains(&t.id));
         self.trash_menu = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let _task_guard = task_guard;
             let (done, listed) = task.await;
             let _ = this.update(cx, |w, cx| {
-                w.trash = listed.trash;
+                for (key, trash) in listed.lists { w.trash = w.store.merge_trash(&key, trash); }
                 let mut errors = done.errors;
                 errors.extend(listed.warnings.iter().map(|s| crate::settings::diagnostic(s)));
                 if errors.is_empty() { w.show_toast(success, cx); }
@@ -308,6 +313,49 @@ impl Workspace {
                     w.status = crate::app::SaveStatus::Failed(msg);
                 }
                 cx.notify();
+            });
+        }).detach();
+    }
+
+    /// What the unused-asset sweep (#237) reads besides the library: the
+    /// sources every open editor holds — this window's and the others',
+    /// quick notes included — that the disk does not (unsaved text, the
+    /// snapshots Undo can still bring back), and the 本机文件 and 本机文件夹,
+    /// whose pasted pictures are copied into the library's assets too.
+    pub(crate) fn sweep_inputs(&self, window: &Window, cx: &Context<Self>) -> (Vec<String>, Vec<std::path::PathBuf>) {
+        let mut live: Vec<String> = self.editor.as_ref().map(|e| e.read(cx).core.asset_refs()).unwrap_or_default();
+        // This window is being updated: reading it again would panic.
+        let me = window.window_handle().window_id();
+        for w in cx.windows().into_iter().filter(|w| w.window_id() != me).filter_map(|w| w.downcast::<Workspace>()) {
+            let Ok(ws) = w.entity(cx) else { continue };
+            if let Some(e) = &ws.read(cx).editor { live.extend(e.read(cx).core.asset_refs()); }
+        }
+        let outside = self.entries.iter().filter_map(|e| e.meta.path.as_ref().map(std::path::PathBuf::from)).collect();
+        (live, outside)
+    }
+
+    pub(crate) fn sweep_failed(&mut self, e: &anyhow::Error, cx: &mut Context<Self>) {
+        log::warn!("unused assets: {e:#}");
+        self.show_toast_kind(ToastKind::Error, &crate::localized_format!("无法读取文档库，未清理：{}", "Could not read the library; nothing was removed: {}", e), cx);
+    }
+
+    /// 设置 › 文档库 › 未使用资源 (#237): take away the listed files that are
+    /// still unused. The sweep runs again first, off the UI thread: a page
+    /// restored or a picture brought back by Undo since the list was made
+    /// keeps its file.
+    pub(crate) fn remove_unused_assets(&mut self, names: Vec<(String, u64)>, window: &Window, cx: &mut Context<Self>) {
+        let root = crate::store::Store::active_dir();
+        let (live, outside) = self.sweep_inputs(window, cx);
+        cx.spawn(async move |this, cx| {
+            let gone = cx.background_executor().spawn(async move {
+                let still = crate::store::Store::unused_assets_at(root.clone(), live, outside)?;
+                let names: Vec<String> = names.into_iter().map(|(n, _)| n).filter(|n| still.iter().any(|(s, _)| s == n)).collect();
+                anyhow::Ok(crate::store::Store::remove_unused_assets(&root, &names))
+            }).await;
+            let _ = this.update(cx, |w, cx| match gone {
+                Ok(0) => w.show_toast(crate::settings::text("没有可清理的资源"), cx),
+                Ok(n) => w.show_toast_kind(ToastKind::Success, &crate::localized_format!("已移出 {} 个未使用资源", "Moved {} unused assets out of the asset folder", n), cx),
+                Err(e) => w.sweep_failed(&e, cx),
             });
         }).detach();
     }
@@ -324,9 +372,67 @@ impl Workspace {
         }
     }
 
-    /// The confirmation dialog: a modal (white, radius 16), a 15pt
-    /// semibold title, one line of 13pt body, 取消 and the action button on
-    /// the right.
+    /// The action button, and ↩ while the dialog is up.
+    pub(crate) fn confirm_ok(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.confirm.take() else { return };
+        match c {
+            Confirm::Delete { ids, batch } => {
+                if batch {
+                    self.batch = None;
+                }
+                self.delete_docs(&ids, window, cx);
+            }
+            Confirm::Restore(id) => self.restore_doc(&id, cx),
+            Confirm::Purge(id) => self.purge_doc(&id, cx),
+            Confirm::EmptyTrash => self.empty_trash(cx),
+            Confirm::RemoveUnused(files) => self.remove_unused_assets(files, window, cx),
+            Confirm::Refs { show, no_ask } => {
+                if no_ask {
+                    let mut s = self.store.settings();
+                    s.refs_hide_no_ask = true;
+                    let _ = self.store.save_settings(&s);
+                }
+                self.set_refs_hidden(!show, cx);
+            }
+            Confirm::SaveFailed => self.resolve_save_failed(true, window, cx),
+            Confirm::Migrate(_) => self.migrate_library(window, cx),
+            Confirm::RemoveFolder(key, _) => self.remove_folder(&key, window, cx),
+            Confirm::Import { what, target } => self.import_dropped(what, target, window, cx),
+            Confirm::AddFolder(ask) => self.add_asked_folder(ask, window, cx),
+        }
+        cx.notify();
+    }
+
+    /// 取消 and Esc: close the dialog, and drop what was waiting on a save.
+    pub(crate) fn dismiss_confirm(&mut self, cx: &mut Context<Self>) {
+        self.confirm = None;
+        self.after_save = None;
+        cx.notify();
+    }
+
+    /// A dialog takes focus as it opens, so ↩ can't reach the document
+    /// beneath, and gives it back where it was once it closes (unless what
+    /// the dialog did moved it on).
+    pub(crate) fn sync_confirm_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match (self.confirm.is_some(), self.confirm_return.is_some()) {
+            (true, false) => {
+                self.confirm_return = Some(window.focused(cx).map(|f| f.downgrade()));
+                window.focus(&self.confirm_focus, cx);
+            }
+            (false, true) => {
+                let back = self.confirm_return.take().flatten().and_then(|f| f.upgrade());
+                if !self.confirm_focus.is_focused(window) { return }
+                match back.or_else(|| self.editor.as_ref().map(|e| e.read(cx).focus.clone())) {
+                    Some(f) => window.focus(&f, cx),
+                    None => window.focus(&self.focus, cx),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The confirmation dialog: a `Dialog` with its title, one line of body,
+    /// 取消 and the action button on the right.
     pub(crate) fn render_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let c = self.confirm.as_ref()?;
         let title_of = |id: &str| {
@@ -352,6 +458,13 @@ impl Workspace {
                 true,
             ),
             Confirm::Purge(_) => (crate::settings::text("确认彻底删除？").to_string(), crate::settings::text("彻底删除后，该页面及其子页面将无法恢复").to_string(), crate::settings::text("删除"), true),
+            Confirm::RemoveUnused(files) => (
+                crate::settings::text("清理未使用资源").to_string(),
+                crate::localized_format!("{} 个文件（{}）将移到文档库的 .quiet/removed-assets 文件夹，{} 天后自动删除；在此之前可以从那里拖回 .assets。", "{} files ({}) will be moved to .quiet/removed-assets in the library and deleted after {} days; until then they can be dragged back to .assets.",
+                    files.len(), crate::docinfo::format_size(files.iter().map(|(_, n)| n).sum()), crate::store::TRASH_DAYS),
+                crate::settings::text("移出"),
+                true,
+            ),
             Confirm::Refs { show: false, .. } => (
                 crate::settings::text("是否隐藏引用列表？").to_string(),
                 crate::settings::text("选择隐藏后，协作者将无法查看本文的引用列表。如需重新显示，可点击文档右上角的更多按钮“...”，打开“显示引用列表”开关。").to_string(),
@@ -370,17 +483,23 @@ impl Workspace {
                 };
                 (
                     crate::settings::tr("把文档库改为真实文件夹？", "Move the library to real folders?").to_string(),
-                    why + crate::settings::tr(
+                    why + if cfg!(target_os = "macos") { crate::settings::tr(
                         "改完后，在访达里看到的文件夹和文件就是侧栏里的样子，文件以标题命名。别的电脑上的旧版 Quiet.md 打不开改过的文档库，请先把它们更新到最新版本。原来的文件会在文档库的 .quiet 文件夹里保留 30 天。",
-                        "Afterwards, Finder shows the same folders and files as the sidebar, each file named by its title. Older versions of Quiet.md on other computers can't open the moved library, so update them first. The old files are kept in the library's .quiet folder for 30 days."),
+                        "Afterwards, Finder shows the same folders and files as the sidebar, each file named by its title. Older versions of Quiet.md on other computers can't open the moved library, so update them first. The old files are kept in the library's .quiet folder for 30 days.") }
+                    else if cfg!(target_os = "windows") { crate::settings::tr(
+                        "改完后，在文件资源管理器里看到的文件夹和文件就是侧栏里的样子，文件以标题命名。别的电脑上的旧版 Quiet.md 打不开改过的文档库，请先把它们更新到最新版本。原来的文件会在文档库的 .quiet 文件夹里保留 30 天。",
+                        "Afterwards, File Explorer shows the same folders and files as the sidebar, each file named by its title. Older versions of Quiet.md on other computers can't open the moved library, so update them first. The old files are kept in the library's .quiet folder for 30 days.") }
+                    else { crate::settings::tr(
+                        "改完后，在文件管理器里看到的文件夹和文件就是侧栏里的样子，文件以标题命名。别的电脑上的旧版 Quiet.md 打不开改过的文档库，请先把它们更新到最新版本。原来的文件会在文档库的 .quiet 文件夹里保留 30 天。",
+                        "Afterwards, your file manager shows the same folders and files as the sidebar, each file named by its title. Older versions of Quiet.md on other computers can't open the moved library, so update them first. The old files are kept in the library's .quiet folder for 30 days.") },
                     crate::settings::tr("改用文件夹", "Move"),
                     false,
                 )
             }
-            Confirm::SwitchLibrary(root) => (
-                crate::settings::tr("换用这个文档库？", "Switch to this library?").to_string(),
-                crate::localized_format!("Quiet.md 会保存当前文档并重启，然后打开 {}。原来的文档库留在原处，不会移动或删除，之后可以再换回来。", "Quiet.md saves the open document, restarts and opens {}. The current library stays where it is, nothing is moved or deleted, and you can switch back later.", root.display()),
-                crate::settings::tr("切换并重启", "Switch and Restart"),
+            Confirm::RemoveFolder(_, name) => (
+                crate::localized_format!("从侧栏移除「{}」？", "Remove “{}” from the sidebar?", name),
+                crate::settings::tr("只是从侧栏去掉，文件夹里的文件不会删除。以后重新打开这个文件夹，置顶、历史版本和回收站都还在。", "It only leaves the sidebar; nothing in the folder is deleted. Open the folder again later and its pins, history and Trash are still there.").to_string(),
+                crate::settings::tr("移除", "Remove"),
                 false,
             ),
             Confirm::Import { what, target } => {
@@ -397,6 +516,20 @@ impl Workspace {
                     false,
                 )
             }
+            Confirm::AddFolder(ask) => {
+                let name = ask[0].0.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let why = match ask[0].1 {
+                    fdl_core::shown::Survey::Big => crate::localized_format!("这个文件夹里有 {} 多个文件。", "This folder holds more than {} files. ", crate::loading::grouped(fdl_core::shown::SURVEY_LIMIT)),
+                    _ => crate::settings::tr("这个文件夹看起来是代码项目。", "This folder looks like a code project. ").to_string(),
+                };
+                (
+                    crate::localized_format!("添加「{}」？", "Add “{}”?", name),
+                    why + crate::settings::tr("Quiet.md 只显示其中的 Markdown 文件和 Quiet.md 文档，不进入依赖、构建产物和 .gitignore 忽略的文件夹；添加后，文件夹里会多一个隐藏的 .quiet 文件夹。",
+                        "Quiet.md shows only its Markdown files and Quiet.md documents, and skips dependencies, build output and what .gitignore leaves out. Adding it puts a hidden .quiet folder inside."),
+                    crate::settings::tr("添加", "Add"),
+                    false,
+                )
+            }
             Confirm::SaveFailed => (
                 crate::settings::text("文档保存失败").to_string(),
                 crate::localized_format!("{}。可以重试或另存副本；重新载入将放弃未保存的修改并载入磁盘内容。", "{}. Retry or save a copy. Reload discards unsaved changes and loads the document from disk.", self.save_error()),
@@ -408,22 +541,22 @@ impl Workspace {
             Confirm::Refs { show: false, no_ask } => Some(*no_ask),
             _ => None,
         };
-        let ok = primary_button("confirm-ok", action);
-        let ok = if danger { ok.bg(Theme::danger()).hover(|s| s.bg(theme::c(craft::R600))).active(|s| s.bg(theme::c(craft::R700))) } else { ok };
-        let dialog = dialog("confirm-dialog")
-            .w(px(if matches!(c, Confirm::SaveFailed | Confirm::Migrate(_) | Confirm::SwitchLibrary(_)) { 520. } else { 400. }))
-            .px(px(24.))
-            .pt(px(20.))
-            .pb(px(24.))
+        let ok = if danger { Button::destructive("confirm-ok") } else { Button::primary("confirm-ok") }.label(action);
+        // The dialog holds focus while it is up (`sync_confirm_focus`): ↩ and Esc are its own keys.
+        let dialog = Dialog::alert("confirm-dialog")
+            .key_context("Confirm")
+            .track_focus(&self.confirm_focus)
+            .on_action(cx.listener(|w, _: &ConfirmOk, window, cx| w.confirm_ok(window, cx)))
+            .on_action(cx.listener(|w, _: &ConfirmCancel, _, cx| w.dismiss_confirm(cx)))
+            .w(px(if matches!(c, Confirm::SaveFailed | Confirm::Migrate(_)) { 520. } else { 400. }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().text_size(px(15.)).line_height(px(22.)).font_weight(FontWeight::SEMIBOLD).child(ui_para(title)))
-            .child(div().mt(px(8.)).text_size(px(13.)).line_height(px(20.)).text_color(Theme::text()).child(ui_para(body)))
-            .child(
+            .title(title)
+            .description(body)
+            .footer(
                 div()
-                    .mt(px(24.))
                     .flex()
                     .items_center()
-                    .gap(px(12.))
+                    .gap(px(8.))
                     .child(div().flex_1().children(no_ask.map(|on| {
                         div()
                             .id("confirm-no-ask")
@@ -431,70 +564,35 @@ impl Workspace {
                             .items_center()
                             .gap(px(8.))
                             .cursor_pointer()
-                            .text_size(px(13.))
                             .on_click(cx.listener(|w, _, _, cx| {
                                 if let Some(Confirm::Refs { no_ask, .. }) = &mut w.confirm {
                                     *no_ask = !*no_ask;
                                 }
                                 cx.notify();
                             }))
-                            .child(crate::ui::checkbox(on))
+                            .child(Checkbox::new(on))
                             .child(ui_text(crate::settings::text("不再提示")))
                     })))
-                    .child(secondary_button("confirm-cancel", if matches!(c, Confirm::Migrate(_)) { crate::settings::tr("稍后", "Later") } else { crate::settings::text("取消") }).on_click(cx.listener(|w, _, _, cx| {
+                    .child(Button::outline("confirm-cancel").label(if matches!(c, Confirm::Migrate(_)) { crate::settings::tr("稍后", "Later") } else { crate::settings::text("取消") }).on_click(cx.listener(|w, _, _, cx| {
                         // 稍后 asks again in a week, not at every launch.
                         if matches!(w.confirm, Some(Confirm::Migrate(_))) { crate::settings::migrate_later(); }
-                        w.confirm = None;
-                        w.after_save = None;
-                        cx.notify();
+                        w.dismiss_confirm(cx);
                     })))
                     .when(matches!(c, Confirm::SaveFailed), |d| {
-                        d.child(secondary_button("confirm-save-copy", crate::settings::tr("另存副本", "Save a copy")).on_click(cx.listener(|w, _, window, cx| {
+                        d.child(Button::outline("confirm-save-copy").label(crate::settings::tr("另存副本", "Save a copy")).on_click(cx.listener(|w, _, window, cx| {
                             w.save_failed_copy(window, cx);
                         })))
-                        .child(secondary_button("confirm-discard", crate::settings::tr("重新载入", "Reload")).text_color(Theme::danger()).on_click(cx.listener(|w, _, window, cx| {
+                        .child(Button::destructive("confirm-discard").label(crate::settings::tr("重新载入", "Reload")).on_click(cx.listener(|w, _, window, cx| {
                             w.confirm = None;
                             w.resolve_save_failed(false, window, cx);
                         })))
                     })
-                    .child(ok.on_click(cx.listener(|w, _, window, cx| {
-                        let Some(c) = w.confirm.take() else { return };
-                        match c {
-                            Confirm::Delete { ids, batch } => {
-                                if batch {
-                                    w.batch = None;
-                                }
-                                w.delete_docs(&ids, window, cx);
-                            }
-                            Confirm::Restore(id) => w.restore_doc(&id, cx),
-                            Confirm::Purge(id) => w.purge_doc(&id, cx),
-                            Confirm::EmptyTrash => w.empty_trash(cx),
-                            Confirm::Refs { show, no_ask } => {
-                                if no_ask {
-                                    let mut s = w.store.settings();
-                                    s.refs_hide_no_ask = true;
-                                    let _ = w.store.save_settings(&s);
-                                }
-                                w.set_refs_hidden(!show, cx);
-                            }
-                            Confirm::SaveFailed => w.resolve_save_failed(true, window, cx),
-                            Confirm::Migrate(_) => w.migrate_library(window, cx),
-                            Confirm::SwitchLibrary(root) => cx.defer(move |cx| crate::app::switch_library(root, cx)),
-                            Confirm::Import { what, target } => w.import_dropped(what, target, window, cx),
-                        }
-                        cx.notify();
-                    }))),
+                    .child(ok.on_click(cx.listener(|w, _, window, cx| w.confirm_ok(window, cx)))),
             );
         Some(
             deferred(
-                div()
+                crate::design::scrim()
                     .id("confirm-mask")
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(scrim())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(dialog),
             )

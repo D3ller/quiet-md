@@ -2,6 +2,7 @@
 //! (design-spec §2–§3). Floating panels are in `overlays.rs`.
 
 use super::core::{self, Pos, TITLE, Unit};
+use super::drag::{Flow, Shift};
 use super::text::{LayoutCache, RichTextElement, TextSpec};
 use super::view::{BoundsMap, Editor, Menu};
 use crate::model::*;
@@ -40,6 +41,8 @@ pub(super) struct Frame {
     units: Rc<Vec<Unit>>,
     pub eqnos: Rc<HashMap<BlockId, u32>>,
     selected: Rc<HashSet<BlockId>>,
+    /// The block selection `selected` was computed for.
+    sel: Option<core::BlockSel>,
     focused: bool,
 }
 
@@ -104,13 +107,14 @@ fn hash_block(b: &Block, orders: &rustc_hash::FxHashMap<BlockId, String>, h: &mu
     b.folded.hash(h);
     match &b.kind {
         BlockKind::Heading { level, .. } => (level, orders.get(&b.id)).hash(h),
-        BlockKind::Code { wrap, .. } => wrap.hash(h),
+        BlockKind::Code { wrap, show_code, .. } => (wrap, show_code).hash(h),
         BlockKind::Image { src, width, height, caption, crop, .. } => {
             (src, width.map(f32::to_bits), height.map(f32::to_bits), caption.as_ref().map(String::len), crop.map(|c| c.map(f32::to_bits))).hash(h)
         }
         BlockKind::Column { ratio } => ratio.to_bits().hash(h),
         BlockKind::File(f) => (&f.src, &f.name, f.view).hash(h),
         BlockKind::Board(bd) => bd.height.to_bits().hash(h),
+        BlockKind::DataTable(t) => (&t.src, t.height.to_bits()).hash(h),
         BlockKind::Table(t) => {
             t.col_widths.iter().for_each(|w| w.to_bits().hash(h));
             (t.header_rows, t.header_col).hash(h);
@@ -202,7 +206,7 @@ pub(super) fn visible_with_gaps(list: &[Block], env: Env) -> Vec<(usize, f32)> {
 pub(super) fn record_bounds(id: BlockId, map: BoundsMap) -> impl IntoElement {
     canvas(
         move |b, _, _| {
-            map.borrow_mut().insert(id, b);
+            map.borrow_mut().insert(id, super::drag::undrawn(b));
         },
         |_, _, _, _| {},
     )
@@ -297,8 +301,8 @@ impl R<'_> {
         let st = theme::style();
         let mut spec = TextSpec::body();
         if env.cell {
-            spec.size = st.num("table.size");
-            spec.line_height = st.num("table.line-height");
+            spec.size = theme::doc_len(st.num("table.size"));
+            spec.line_height = theme::doc_len(st.num("table.line-height"));
         }
         if let BlockKind::Heading { level, .. } = b.kind {
             let m = theme::heading_metrics(level);
@@ -327,15 +331,24 @@ impl R<'_> {
     /// A column of sibling blocks with collapsed margins and heading folding.
     pub fn blocks(&self, list: &[Block], env: Env, cx: &mut Context<Editor>) -> Div {
         let mut col = div().flex().flex_col().w_full();
+        // While blocks move: the container these are in, to make room in.
+        let flow = list.first().filter(|_| !self.ghost && self.ed.drag_fx_live()).and_then(|b| self.ed.core.parent_of(b.id)).map(|p| Flow::In(p.id));
+        let mut slot = flow.and_then(|f| self.ed.drag_slot_at(f));
         for (i, gap) in visible_with_gaps(list, env) {
+            if slot.is_some_and(|at| at <= i) {
+                slot = None;
+                col = col.child(self.ed.slot_el());
+            }
             // Nested rows are drawn here rather than by `render_item`, so the
             // 版本历史 tint has to be applied on this wrapper.
-            col = col.child(
-                div()
-                    .mt(px(gap))
-                    .when_some(self.ed.mark_fill(list[i].id), |d, fill| d.rounded(px(3.)).bg(fill))
-                    .child(self.block(&list[i], list, i, Env { root: false, ..env }, cx)),
-            );
+            let el = div()
+                .mt(px(gap))
+                .when_some(self.ed.mark_fill(list[i].id), |d, fill| d.rounded(px(3.)).bg(fill))
+                .child(self.block(&list[i], list, i, Env { root: false, ..env }, cx));
+            col = col.child(Shift::wrap(el, flow.and_then(|f| self.ed.drawn_shift(f, i, list[i].id))));
+        }
+        if slot.is_some() {
+            col = col.child(self.ed.slot_el());
         }
         col
     }
@@ -458,6 +471,7 @@ impl R<'_> {
             BlockKind::SubPageList => self.sub_page_list(b, cx),
             BlockKind::Countdown(c) => self.countdown(b, c, cx),
             BlockKind::Board(bd) => self.board_block(b, bd, cx),
+            BlockKind::DataTable(t) => self.datatable_block(b, t, cx),
             BlockKind::File(f) => self.file(b, f, env, cx),
             BlockKind::Table(t) if self.ghost => self.ghost_table(b, t, cx),
             BlockKind::Table(t) => self.table(b, t, env.root, cx),
@@ -517,7 +531,7 @@ impl R<'_> {
             .child(record_bounds(b.id, self.bounds.clone()))
             .children(handle)
             .children(self.fold_button(b, env, cx))
-            .when(!self.ghost && self.ed.is_dragged(b.id), |d| d.opacity(0.5))
+            .when(!self.ghost && self.ed.is_dragged(b.id), |d| d.opacity(0.))
             .children(self.ed.drop_flash_el(b.id).filter(|_| !self.ghost))
             .when(atomic_caret && self.focused, |d| {
                 d.child(
@@ -591,7 +605,7 @@ impl R<'_> {
                         e.core.toggle_fold(id);
                         e.core.fix_selection();
                         e.keep_read_only_fold();
-                        e.fold_anim = Some((id, std::time::Instant::now()));
+                        e.fold_anim = Some((id, web_time::Instant::now()));
                         if selection == (e.core.sel, e.core.block_sel) {
                             e.changed_preserving_viewport(window, cx);
                         } else {
@@ -642,7 +656,7 @@ impl R<'_> {
                         .flex()
                         .items_center()
                         .whitespace_nowrap()
-                        .font_family(theme::UI_FONT)
+                        .font_family(theme::DOC_UI_FONT)
                         .font_weight(weight)
                         .text_size(px(size))
                         .text_color(Theme::text_caption())
@@ -659,6 +673,10 @@ impl R<'_> {
         if crate::settings::feishu() { return self.children_of_feishu(b, env, cx); }
 
         if b.children.is_empty() || b.folded || self.flat == Some(b.id) {
+            // The first child about to be dropped in.
+            if b.children.is_empty() && !self.ghost && self.ed.drag_slot_at(Flow::In(b.id)) == Some(0) {
+                return div().pl(px(theme::style().num("list.indent"))).child(self.ed.slot_el());
+            }
             return div();
         }
         let indent = theme::style().num("list.indent");
@@ -671,6 +689,9 @@ impl R<'_> {
         let spec = self.spec_for(b, env);
         let lh = spec.line_height;
         let id = b.id;
+        // An item that reads right to left (see `text::row_starts`) keeps its
+        // marker on the right, beside the text.
+        let rtl = b.align == crate::model::Align::Left && super::bidi::rtl_line(b.text.text.split('\n').next().unwrap_or(""));
         let marker: AnyElement = match b.kind {
             // Drawn rather than typeset so the dot size (5.5) and its centring
             // on the line don't depend on how the font's bullet glyph renders.
@@ -683,7 +704,7 @@ impl R<'_> {
                     1 => dot.rounded_full().border_1().border_color(c),
                     _ => dot.size(px(4.5)).rounded(px(1.)).bg(c),
                 };
-                div().w(px(18.)).pl(px(5.)).mr(px(6.)).flex().child(dot).into_any_element()
+                div().w(px(18.)).when(!rtl, |d| d.pl(px(5.)).mr(px(6.))).when(rtl, |d| d.pr(px(5.)).ml(px(6.)).justify_end()).flex().child(dot).into_any_element()
             }
             BlockKind::Ordered { .. } => div()
                 .id(("ordered-number", id.0))
@@ -696,9 +717,10 @@ impl R<'_> {
                 }))
                 .min_w(px(18.))
                 .px(px(1.))
-                .mr(px(6.))
+                .when(!rtl, |d| d.mr(px(6.)))
+                .when(rtl, |d| d.ml(px(6.)))
                 .whitespace_nowrap()
-                .font_family(theme::UI_FONT)
+                .font_family(theme::DOC_UI_FONT)
                 .text_size(px(spec.size))
                 .text_color(theme::style().color("number.color").unwrap_or_else(Theme::text))
                 .child(core::ordered_marker(core::ordered_number(siblings, idx), env.depth))
@@ -713,10 +735,11 @@ impl R<'_> {
                 div()
                     .id(("todo", id.0))
                     .size(px(box_size))
-                    .mr(px(8.))
+                    .when(!rtl, |d| d.mr(px(8.)))
+                    .when(rtl, |d| d.ml(px(8.)))
                     .rounded(px(st.num("task.radius")))
                     .border_1()
-                    .when(!done, |d| d.border_color(Theme::todo_box()).bg(crate::theme::raised(Theme::bg_body())).hover(|s| s.border_color(Theme::primary())))
+                    .when(!done, |d| d.border_color(crate::theme::lift(Theme::todo_box(), 3.)).bg(crate::theme::raised(Theme::bg_body())).hover(|s| s.border_color(Theme::primary())))
                     .when(done, |d| d.border_color(fill).bg(fill))
                     .flex()
                     .items_center()
@@ -727,7 +750,7 @@ impl R<'_> {
                         MouseButton::Left,
                         cx.listener(move |e, _, window, cx| {
                             cx.stop_propagation();
-                            window.focus(&e.focus);
+                            window.focus(&e.focus, cx);
                             e.core.toggle_todo(id);
                             e.changed_preserving_viewport(window, cx);
                         }),
@@ -745,6 +768,7 @@ impl R<'_> {
                 div()
                     .id(("row", id.0))
                     .flex()
+                    .when(rtl, |d| d.flex_row_reverse())
                     .when(todo, |d| {
                         d.mx(px(-3.))
                             .px(px(3.))
@@ -772,7 +796,7 @@ impl R<'_> {
         let id = b.id;
         let g = SharedString::from(format!("code-{}", id.0));
         let st = theme::style();
-        let (code_size, code_line, radius) = (st.num("pre.size"), st.num("pre.line"), st.num("pre.radius"));
+        let (code_size, code_line, radius) = (theme::doc_len(st.num("pre.size")), theme::doc_len(st.num("pre.line")), st.num("pre.radius"));
         let gutter_w = if st.flag("pre.numbers") { GUTTER_W } else { 0. };
         // SF Mono 13 on a 20pt line.
         let spec = TextSpec {
@@ -790,6 +814,9 @@ impl R<'_> {
             font: None,
             italic: false,
             font_runs: None,
+            metrics: None,
+            breaks: None,
+            shift: Point::default(),
         };
         // Line numbers follow the wrapped rows of the last layout.
         let rows_per_line: Vec<usize> = {
@@ -811,7 +838,12 @@ impl R<'_> {
         // Header: fold triangle, caption at x 29, then the toolbar (22 tall,
         // right-aligned), revealed on hover / while editing.
         let editing = self.focused && self.ed.core.sel.head.block == id;
-        let folded = self.ed.code_folded.contains(&id);
+        let folded = b.folded;
+        let show_code = matches!(b.kind, BlockKind::Code { show_code: true, .. });
+        let mermaid = !folded && lang == crate::mermaid::LANG && crate::mermaid::SUPPORTED;
+        // A Mermaid block shows its diagram, under the code while the caret is in it.
+        let reveal = editing && !self.ed.read_only;
+        let diagram = if mermaid && !show_code { self.diagram(b, reveal, 36., 16., cx) } else { None };
         // Handle hovered / its menu open (`.hovered`): light blue ring
         // over a clear body so the block tint shows; block-selected: blue
         // border on the gray body.
@@ -912,16 +944,13 @@ impl R<'_> {
             )
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |e, _, _, cx| {
+                cx.listener(move |e, _, window, cx| {
                     cx.stop_propagation();
-                    if !e.code_folded.remove(&id) {
-                        e.code_folded.insert(id);
-                        // Leave the hidden code (it opens again if the caret comes back).
-                        if e.core.sel.head.block == id || e.core.sel.anchor.block == id {
-                            e.core.select_block(id);
-                        }
-                    }
-                    cx.notify();
+                    // Saved with the document; a caret in the hidden code leaves for the
+                    // block (it opens again if the caret comes back).
+                    e.core.set_code_folded(id, !folded);
+                    e.keep_read_only_fold();
+                    e.changed_preserving_viewport(window, cx);
                 }),
             );
         let border = if menu_on {
@@ -970,7 +999,7 @@ impl R<'_> {
                     .pr(px(6.))
                     .flex()
                     .items_center()
-                    .font_family(theme::UI_FONT)
+                    .font_family(theme::DOC_UI_FONT)
                     .children(caption)
                     .child(
                         div()
@@ -1001,6 +1030,18 @@ impl R<'_> {
                                         ),
                                 )
                             })
+                            .when(mermaid, |d| {
+                                d.child(
+                                    header_btn("code-view")
+                                        .child(icon(if show_code { "view-preview" } else { "code" }, 14., Theme::icon()))
+                                        .child(if show_code { crate::settings::tr("显示图表", "Show diagram") } else { crate::settings::tr("隐藏图表", "Hide diagram") })
+                                        .child(sep(-3.))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(move |e, _, window, cx| {
+                                            cx.stop_propagation();
+                                            e.toggle_diagram(id, window, cx);
+                                        })),
+                                )
+                            })
                             .child(
                                 header_btn("code-copy")
                                     .child(icon("copy", 14., Theme::icon()))
@@ -1017,7 +1058,7 @@ impl R<'_> {
             )
             .child(fold_btn)
             .when(folded, |d| d.child(div().h(px(36.))))
-            .when(!folded, |d| {
+            .when(!folded && (diagram.is_none() || reveal), |d| {
                 d.child(
                     div()
                         .pt(px(36.))
@@ -1049,12 +1090,91 @@ impl R<'_> {
                         .child(self.code_column(id, wrap, el, 12.)),
                 )
             })
+            .children(diagram)
             .into_any_element()
     }
 }
 
 /// Code blocks: SF Mono 13 / 20, a 36pt line-number gutter.
 const GUTTER_W: f32 = 36.;
+
+impl R<'_> {
+    /// A Mermaid block's diagram (mermaid.rs) with its state: below the code
+    /// (`below`) while the caret is in the block, else in its place (`top`
+    /// clears the toolbar), where a click puts the caret in the code.
+    fn diagram(&self, b: &Block, below: bool, top: f32, side: f32, cx: &mut Context<Editor>) -> Option<AnyElement> {
+        if b.text.text.trim().is_empty() { return None; }
+        let id = b.id;
+        let (shown, note) = match crate::mermaid::look(id.0, &b.text.text, cx) {
+            crate::mermaid::Look::Ready(d) => (Some(d), None),
+            crate::mermaid::Look::Pending(d) => {
+                let note = d.is_none().then(|| crate::settings::tr("正在绘制图表…", "Drawing the diagram…").to_string());
+                (d, note)
+            }
+            crate::mermaid::Look::Failed(m, d) => {
+                let m: Vec<&str> = m.lines().take(6).collect();
+                (d, Some(format!("{}{}", crate::settings::tr("图表有误：", "Diagram error: "), m.join("\n"))))
+            }
+        };
+        let pic = shown.map(|d| {
+            // Shrunk to the text column (inside columns or cells it may still clip).
+            let avail = (self.ed.content_width() - 2. * side - 2.).max(40.);
+            let k = (avail / d.size.0).min(1.);
+            div().w(px(d.size.0 * k)).h(px(d.size.1 * k)).max_w_full().child(img(d.image).size_full().object_fit(ObjectFit::Contain))
+        });
+        Some(
+            div()
+                .id(("code-diagram", id.0))
+                .when(below, |d| d.mt(px(-4.)).pt(px(12.)).border_t_1().border_color(Theme::line_divider()))
+                .when(!below, |d| d.pt(px(top)))
+                .pb(px(12.))
+                .px(px(side))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(8.))
+                .children(pic)
+                .children(note.map(|n| {
+                    div().w_full().font_family(theme::MONO_FONT).text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_caption()).child(n)
+                }))
+                .when(!below && !self.ed.read_only, |d| {
+                    d.cursor_text().on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |e, _, window, cx| {
+                            cx.stop_propagation();
+                            e.core.clear_block_sel();
+                            e.menu = None;
+                            e.core.caret_to_end_of(id);
+                            window.focus(&e.focus, cx);
+                            cx.notify();
+                        }),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+}
+
+impl Editor {
+    /// 隐藏图表 / 显示图表 on a Mermaid block: a saved property, like 自动换行.
+    fn toggle_diagram(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
+        self.core.checkpoint(core::EditKind::Other);
+        if let Some(b) = self.core.block_mut(id)
+            && let BlockKind::Code { show_code, .. } = &mut b.kind
+        {
+            *show_code = !*show_code;
+        }
+        self.changed_preserving_viewport(window, cx);
+    }
+
+    /// The row of a Mermaid block the caret is in shows its code too.
+    fn diagram_nonce(&self, focused: bool) -> Option<(BlockId, u64)> {
+        let id = self.core.sel.head.block;
+        let on = crate::mermaid::SUPPORTED && focused && !self.read_only
+            && matches!(self.core.kind_of(id), Some(BlockKind::Code { lang, show_code: false, .. }) if lang == crate::mermaid::LANG);
+        on.then(|| (id, 0x6d65_726d_u64.wrapping_mul(id.0 | 1)))
+    }
+}
 
 pub(super) const TOP: Env = Env { depth: 0, cell: false, color: None, in_callout: false, root: true, column: false, quote: false, width: 0. };
 
@@ -1066,7 +1186,7 @@ impl Editor {
         let mut items = vec![Item::Header];
         let mut h = FxHasher::default();
         // Every row re-measures when the text column changes width.
-        let seed = (self.layout.ml.to_bits(), self.layout.mr.to_bits(), self.column_max().map(f32::to_bits), self.img.generation, crate::themes::generation(), &self.sub_pages, self.links.generation);
+        let seed = (self.layout.ml.to_bits(), self.layout.mr.to_bits(), self.column_max().map(f32::to_bits), self.img.generation, crate::themes::generation(), &self.sub_pages, self.links.generation, crate::mermaid::generation());
         seed.hash(&mut h);
         let seed = h.finish();
         self.core.doc.title.text.len().hash(&mut h);
@@ -1077,9 +1197,7 @@ impl Editor {
         let links = self.links_key();
         // Rows whose look depends on editor state, not the document.
         let mut nonces = self.grid_overrides();
-        // A folded code block is a 40px row.
-        nonces.extend(self.code_folded.iter().map(|&id| (id, id.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)));
-        nonces.extend(self.image_nonces(focused).into_iter().chain(self.button_nonce()));
+        nonces.extend(self.image_nonces(focused).into_iter().chain(self.button_nonce()).chain(self.diagram_nonce(focused)));
         // Walking a long document costs ~1.5ms (1M chars): skip it when
         // nothing the rows depend on changed, as on every scrolling frame.
         let mut fh = FxHasher::default();
@@ -1166,6 +1284,10 @@ impl Editor {
                 b = list.get(i);
                 list = b.map_or(&[][..], |b| b.children.as_slice());
             }
+            if let Some(&top) = path.first() {
+                let r = self.rendered_top.get().map_or((top, top), |(a, z)| (a.min(top), z.max(top)));
+                self.rendered_top.set(Some(r));
+            }
             let found = b.map(super::caption::captions_in).unwrap_or_default();
             if !found.is_empty() {
                 self.ensure_captions(found, window, cx);
@@ -1192,7 +1314,7 @@ impl Editor {
                 spec.line_height = theme::title().line_height;
                 spec.weight = FontWeight(theme::style().num("title.weight"));
                 if let Some(c) = theme::style().color("title.color") { spec.color = c; }
-                let tf = theme::style().font("title.font");
+                let tf = theme::title_font();
                 if tf != theme::body_font() { spec.font = Some(tf); }
                 cover = self.cover_el(window, cx);
                 div()
@@ -1216,8 +1338,10 @@ impl Editor {
                 // Depth of the outermost selected ancestor, whose highlight
                 // spans its children's rows too.
                 let mut sel_depth = None;
-                // Rows of a dragged block's subtree fade with it.
+                // Rows of a dragged block's subtree go with it.
                 let mut dimmed = false;
+                // A dropped block gliding in takes the rows under it along.
+                let mut glide = None;
                 // Ancestors whose background spans this row.
                 let mut bgs = vec![];
                 for (d, &i) in outer.iter().enumerate() {
@@ -1229,6 +1353,9 @@ impl Editor {
                         bgs.push((d, fill));
                     }
                     dimmed |= self.is_dragged(b.id);
+                    if glide.is_none() && self.gliding(b.id) {
+                        glide = Some(b.id);
+                    }
                     list = &b.children;
                 }
                 let Some(b) = list.get(bi) else { return div().into_any_element() };
@@ -1238,11 +1365,12 @@ impl Editor {
                 r.flat = flattens(b).then_some(b.id);
                 let ends = |d: usize| !matches!(self.items.get(ix + 1), Some(Item::Block { path: next, .. }) if next.starts_with(&path[..=d]));
                 let last = sel_depth.is_some_and(ends);
-                div()
+                let shift = self.drawn_shift(Flow::Rows, ix, glide.unwrap_or(b.id));
+                let row = div()
                     .relative()
                     .pt(px(gap))
                     .pl(px(25. * depth as f32))
-                    .when(dimmed, |d| d.opacity(0.5))
+                    .when(dimmed, |d| d.opacity(0.))
                     .children(bgs.into_iter().map(|(d, fill)| {
                         div()
                             .absolute()
@@ -1265,8 +1393,11 @@ impl Editor {
                                 .when(last, |d| d.rounded_b(px(self.block_tint().1)))
                                 .bg(self.block_tint().0),
                         )
-                    })
-                    .into_any_element()
+                    });
+                if self.drag_fx_moving() {
+                    window.request_animation_frame();
+                }
+                Shift::wrap(row, shift)
             }
             Item::Below => div()
                 .id("below")
@@ -1345,7 +1476,7 @@ impl Editor {
         if !matches!(req, Reveal::Block(_))
             && let Some((scroll, _)) = self.code_hscroll.borrow().get(&block)
         {
-            let (b, off, max) = (scroll.bounds(), scroll.offset(), scroll.max_offset().width);
+            let (b, off, max) = (scroll.bounds(), scroll.offset(), scroll.max_offset().x);
             let pad = px(16.);
             let dx = if t.left() < b.left() + pad { b.left() + pad - t.left() } else if t.right() > b.right() - pad { b.right() - pad - t.right() } else { px(0.) };
             let x = (off.x + dx).clamp(-max, px(0.));
@@ -1364,6 +1495,7 @@ impl Editor {
         let overlays = self.render_overlays(window, cx);
         let lightbox = self.lightbox_el(window, cx);
         let board = self.board_el();
+        self.sync_tables(window, cx);
         let toast = self.toast_el(window);
         let probes = std::mem::take(&mut *self.probes.borrow_mut());
         let origin0 = self.content_origin.get();
@@ -1386,6 +1518,7 @@ impl Editor {
         // Reads last frame's bar segments.
         self.table_autoscroll(window);
         self.block_autoscroll(window);
+        self.tick_drag_fx(window);
         self.text_autoscroll(window, cx);
         self.tick_drop_flash(window);
         if let Some((_, t0)) = self.fold_anim {
@@ -1396,6 +1529,7 @@ impl Editor {
         }
         self.cache.borrow_mut().clear();
         self.block_bounds.borrow_mut().clear();
+        self.rendered_top.set(None);
         self.tables.geo.borrow_mut().clear();
         self.tables.stuck.borrow_mut().clear();
         self.img.boxes.borrow_mut().clear();
@@ -1410,13 +1544,13 @@ impl Editor {
             true => (self.frame.units.clone(), self.frame.eqnos.clone()),
             false => (Rc::new(self.core.units()), Rc::new(equation_numbers(&self.core.doc))),
         };
-        self.frame = Frame {
-            generation: Some(generation),
-            units,
-            eqnos,
-            selected: Rc::new(self.core.block_sel_ids().into_iter().collect()),
-            focused,
+        // Walking a long document for the selected blocks costs ~10ms
+        // (1M chars): only when the selection or the document changed.
+        let selected = match self.frame.generation == Some(generation) && self.frame.sel == self.core.block_sel {
+            true => self.frame.selected.clone(),
+            false => Rc::new(self.core.block_sel_ids().into_iter().collect()),
         };
+        self.frame = Frame { generation: Some(generation), units, eqnos, selected, sel: self.core.block_sel, focused };
         // Filled in as the list renders its visible items.
         self.handle_targets.clear();
 
@@ -1464,7 +1598,7 @@ impl Editor {
                     }
                 }
                 if pointer_hidden {
-                    window.set_window_cursor_style(CursorStyle::None);
+                    cx.hide_cursor_until_mouse_moves();
                     let e = entity.clone();
                     window.on_mouse_event(move |_: &MouseMoveEvent, phase, _, cx| {
                         if phase == DispatchPhase::Bubble {
@@ -1472,6 +1606,15 @@ impl Editor {
                                 ed.pointer_hidden = false;
                                 cx.notify();
                             });
+                        }
+                    });
+                }
+                // Touch screens (iOS): long press to select.
+                {
+                    let e = entity.clone();
+                    window.on_mouse_event(move |ev: &LongPressEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble && (ev.phase != TouchPhase::Started || bounds.contains(&ev.start_position)) {
+                            e.update(cx, |ed, cx| ed.on_long_press(ev, window, cx));
                         }
                     });
                 }
@@ -1612,7 +1755,7 @@ impl Editor {
             .size_full()
             .relative()
             // No fill of its own: the note panel behind it is white and rounded.
-            .font_family(theme::UI_FONT)
+            .font_family(theme::ui_family())
             .text_color(Theme::text())
             .on_mouse_move(cx.listener(Self::on_hover_move))
             .on_mouse_up(
@@ -1633,8 +1776,12 @@ impl Editor {
                 div()
                     .id("editor-page")
                     .size_full()
+                    // The note's own labels (list numbers, captions) keep the
+                    // platform face; the menus over it follow 界面字体.
+                    .font_family(theme::DOC_UI_FONT)
                     .cursor(CursorStyle::IBeam)
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_click))
                     .on_drag_move(cx.listener(Self::file_drag_move))
                     .on_drop(cx.listener(Self::drop_files))
                     .child(list(self.list.clone(), cx.processor(Self::render_item)).size_full()),
@@ -1663,11 +1810,12 @@ fn code_rows(cache: &HashMap<BlockId, super::text::TextLayout>) -> HashMap<Block
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         // A board open over the whole window covers the note: only the board
         // renders (the note would otherwise be laid out again on every frame
         // the board draws, and its keys and pointer handlers sit under it).
         if self.board_open() { return div().size_full().children(self.board_el()).into_any_element(); }
+        if self.table_open() { return div().size_full().children(self.table_el()).into_any_element(); }
         let el = self.render_editor(window, cx).into_any_element();
         crate::devtools::RENDER_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         el
@@ -1687,35 +1835,43 @@ impl Editor {
 
     /// "N 字" chip at the bottom right while text is selected (§2).
     fn word_counter(&self) -> Option<AnyElement> {
-        let n = if self.core.in_block_mode() {
-            let index = core::block_index(&self.core.doc);
-            self.core
-                .block_sel_ids()
-                .iter()
-                .filter_map(|id| index.get(id))
-                .map(|b| crate::docinfo::blocks_word_count(std::slice::from_ref(*b)))
-                .sum()
+        let n = if let Some(sel) = self.core.block_sel {
+            // Walking a long document for the selected blocks costs ~10ms
+            // (1M chars): once per selection and edit, not every frame.
+            let key = (self.core.generation, sel);
+            match self.sel_words.get() {
+                Some((k, n)) if k == key => n,
+                _ => {
+                    let n = self.core.block_sel_ids().iter().filter_map(|id| self.core.block(*id)).map(|b| crate::docinfo::blocks_word_count(std::slice::from_ref(b))).sum();
+                    self.sel_words.set(Some((key, n)));
+                    n
+                }
+            }
         } else if self.core.sel.is_collapsed() {
             return None;
         } else {
             crate::docinfo::word_count(&self.core.selected_text())
         };
-        // Selection word count: a small white pill at the note's bottom right.
+        // Selection word count at the note's bottom right: an outline xs
+        // button's face (1px `border`, shadow-xs, radius 8, text-xs), not a
+        // button; opaque (`background`) as it floats over the text.
         Some(
             div()
                 .absolute()
                 .bottom(px(10.))
                 .right(px(34.))
                 .h(px(24.))
-                .px(px(9.))
+                .px(px(8.))
+                .flex()
+                .items_center()
                 .rounded(px(8.))
-                .bg(crate::theme::raised(Theme::bg_body()))
+                .bg(crate::design::color::background())
                 .border_1()
-                .border_color(Theme::button_border())
-                .shadow(theme::shadow_button())
+                .border_color(crate::design::color::border())
+                .shadow(crate::design::shadow::xs())
+                .font_family(crate::theme::ui_family())
                 .text_size(px(12.))
-                .line_height(px(22.))
-                .text_color(Theme::text_caption())
+                .text_color(crate::design::color::muted_foreground())
                 .child(crate::settings::localized(crate::settings::lang(), "{n} 字", || format!("{n} 字"), || format!("{n} {}", if n == 1 { "word" } else { "words" })))
                 .into_any_element(),
         )
@@ -1728,15 +1884,16 @@ fn spec_for_feishu(&self, b: &Block, env: Env) -> TextSpec {
 
         let mut spec = TextSpec::body();
         if env.cell {
-            spec.size = 14.;
-            spec.line_height = 22.;
+            spec.size = crate::themes::doc_len(14.);
+            spec.line_height = crate::themes::doc_len(22.);
         }
         if let BlockKind::Heading { level, .. } = b.kind {
             let m = theme::heading_metrics(level);
-            spec.size = m.size;
-            spec.line_height = m.line_height;
+            spec.size = crate::themes::doc_len(m.size);
+            spec.line_height = crate::themes::doc_len(m.line_height);
             spec.weight = FontWeight::MEDIUM;
-            spec.letter_spacing = m.size * -0.02;
+            spec.letter_spacing = spec.size * -0.02;
+            if let Some(c) = crate::editor_theme::heading_color(level) { spec.color = c; }
         }
         spec.dim_marks = env.quote;
         if let Some(c) = env.color {
@@ -1831,6 +1988,7 @@ pub(super) fn block_feishu(&self, b: &Block, siblings: &[Block], idx: usize, env
             BlockKind::SubPageList => self.sub_page_list(b, cx),
             BlockKind::Countdown(c) => self.countdown(b, c, cx),
             BlockKind::Board(bd) => self.board_block(b, bd, cx),
+            BlockKind::DataTable(t) => self.datatable_block(b, t, cx),
             BlockKind::File(f) => self.file(b, f, env, cx),
             BlockKind::Table(t) if self.ghost => self.ghost_table(b, t, cx),
             BlockKind::Table(t) => self.table(b, t, env.root, cx),
@@ -1888,7 +2046,7 @@ pub(super) fn block_feishu(&self, b: &Block, siblings: &[Block], idx: usize, env
             .child(record_bounds(b.id, self.bounds.clone()))
             .children(handle)
             .children(self.fold_button(b, env, cx))
-            .when(!self.ghost && self.ed.is_dragged(b.id), |d| d.opacity(0.5))
+            .when(!self.ghost && self.ed.is_dragged(b.id), |d| d.opacity(0.))
             .children(self.ed.drop_flash_el(b.id).filter(|_| !self.ghost))
             .when(atomic_caret && self.focused, |d| {
                 d.child(
@@ -1973,6 +2131,9 @@ fn list_item_feishu(&self, b: &Block, siblings: &[Block], idx: usize, env: Env, 
         let spec = self.spec_for(b, env);
         let lh = spec.line_height;
         let id = b.id;
+        // An item that reads right to left (see `text::row_starts`) keeps its
+        // marker on the right, beside the text.
+        let rtl = b.align == crate::model::Align::Left && super::bidi::rtl_line(b.text.text.split('\n').next().unwrap_or(""));
         let marker: AnyElement = match b.kind {
             // Drawn rather than typeset so the dot size (5.5) and its centring
             // on the line don't depend on how the font's bullet glyph renders.
@@ -1983,7 +2144,7 @@ fn list_item_feishu(&self, b: &Block, siblings: &[Block], idx: usize, env: Env, 
                     1 => dot.rounded_full().border_1().border_color(Theme::primary()),
                     _ => dot.size(px(5.)).bg(Theme::primary()),
                 };
-                div().w(px(18.)).pl(px(4.)).mr(px(6.)).flex().child(dot).into_any_element()
+                div().w(px(18.)).when(!rtl, |d| d.pl(px(4.)).mr(px(6.))).when(rtl, |d| d.pr(px(4.)).ml(px(6.)).justify_end()).flex().child(dot).into_any_element()
             }
             BlockKind::Ordered { .. } => div()
                 .id(("ordered-number", id.0))
@@ -1996,7 +2157,8 @@ fn list_item_feishu(&self, b: &Block, siblings: &[Block], idx: usize, env: Env, 
                 }))
                 .min_w(px(18.))
                 .px(px(2.))
-                .mr(px(6.))
+                .when(!rtl, |d| d.mr(px(6.)))
+                .when(rtl, |d| d.ml(px(6.)))
                 .whitespace_nowrap()
                 .font_family(crate::theme::NUMERAL_FONT)
                 .text_size(px(spec.size))
@@ -2008,7 +2170,8 @@ fn list_item_feishu(&self, b: &Block, siblings: &[Block], idx: usize, env: Env, 
                 div()
                     .id(("todo", id.0))
                     .size(px(16.))
-                    .mr(px(8.))
+                    .when(!rtl, |d| d.mr(px(8.)))
+                    .when(rtl, |d| d.ml(px(8.)))
                     .rounded(px(4.))
                     .border_1()
                     .border_color(Theme::text())
@@ -2023,7 +2186,7 @@ fn list_item_feishu(&self, b: &Block, siblings: &[Block], idx: usize, env: Env, 
                         MouseButton::Left,
                         cx.listener(move |e, _, window, cx| {
                             cx.stop_propagation();
-                            window.focus(&e.focus);
+                            window.focus(&e.focus, cx);
                             e.core.toggle_todo(id);
                             e.changed_preserving_viewport(window, cx);
                         }),
@@ -2041,6 +2204,7 @@ fn list_item_feishu(&self, b: &Block, siblings: &[Block], idx: usize, env: Env, 
                 div()
                     .id(("row", id.0))
                     .flex()
+                    .when(rtl, |d| d.flex_row_reverse())
                     .when(todo, |d| {
                         d.mx(px(-2.))
                             .px(px(2.))
@@ -2069,9 +2233,10 @@ fn code_block_feishu(&self, b: &Block, lang: &str, wrap: bool, cx: &mut Context<
 
         let id = b.id;
         let g = SharedString::from(format!("code-{}", id.0));
+        let line = crate::themes::doc_len(22.);
         let spec = TextSpec {
-            size: 14.,
-            line_height: 22.,
+            size: crate::themes::doc_len(14.),
+            line_height: line,
             weight: FontWeight::NORMAL,
             color: Theme::text_code(),
             mono: true,
@@ -2084,6 +2249,9 @@ fn code_block_feishu(&self, b: &Block, lang: &str, wrap: bool, cx: &mut Context<
             font: None,
             italic: false,
             font_runs: None,
+            metrics: None,
+            breaks: None,
+            shift: Point::default(),
         };
         // Line numbers follow the wrapped rows of the last layout.
         let rows_per_line: Vec<usize> = {
@@ -2105,7 +2273,12 @@ fn code_block_feishu(&self, b: &Block, lang: &str, wrap: bool, cx: &mut Context<
         // Header: fold triangle, caption at x 29, then the toolbar (22 tall,
         // right-aligned), revealed on hover / while editing.
         let editing = self.focused && self.ed.core.sel.head.block == id;
-        let folded = self.ed.code_folded.contains(&id);
+        let folded = b.folded;
+        let show_code = matches!(b.kind, BlockKind::Code { show_code: true, .. });
+        let mermaid = !folded && lang == crate::mermaid::LANG && crate::mermaid::SUPPORTED;
+        // A Mermaid block shows its diagram, under the code while the caret is in it.
+        let reveal = editing && !self.ed.read_only;
+        let diagram = if mermaid && !show_code { self.diagram(b, reveal, 40., 20., cx) } else { None };
         // Handle hovered / its menu open (`.hovered`): light blue ring
         // over a clear body so the block tint shows; block-selected: blue
         // border on the gray body.
@@ -2205,16 +2378,13 @@ fn code_block_feishu(&self, b: &Block, lang: &str, wrap: bool, cx: &mut Context<
             )
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |e, _, _, cx| {
+                cx.listener(move |e, _, window, cx| {
                     cx.stop_propagation();
-                    if !e.code_folded.remove(&id) {
-                        e.code_folded.insert(id);
-                        // Leave the hidden code (it opens again if the caret comes back).
-                        if e.core.sel.head.block == id || e.core.sel.anchor.block == id {
-                            e.core.select_block(id);
-                        }
-                    }
-                    cx.notify();
+                    // Saved with the document; a caret in the hidden code leaves for the
+                    // block (it opens again if the caret comes back).
+                    e.core.set_code_folded(id, !folded);
+                    e.keep_read_only_fold();
+                    e.changed_preserving_viewport(window, cx);
                 }),
             );
         let border = if menu_on {
@@ -2248,7 +2418,7 @@ fn code_block_feishu(&self, b: &Block, lang: &str, wrap: bool, cx: &mut Context<
                     .pr(px(8.))
                     .flex()
                     .items_center()
-                    .font_family(theme::UI_FONT)
+                    .font_family(theme::DOC_UI_FONT)
                     .children(caption)
                     .child(
                         div()
@@ -2279,6 +2449,18 @@ fn code_block_feishu(&self, b: &Block, lang: &str, wrap: bool, cx: &mut Context<
                                         ),
                                 )
                             })
+                            .when(mermaid, |d| {
+                                d.child(
+                                    header_btn("code-view")
+                                        .child(icon(if show_code { "view-preview" } else { "code" }, 16., Theme::icon()))
+                                        .child(if show_code { crate::settings::tr("显示图表", "Show diagram") } else { crate::settings::tr("隐藏图表", "Hide diagram") })
+                                        .child(sep(-9.))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(move |e, _, window, cx| {
+                                            cx.stop_propagation();
+                                            e.toggle_diagram(id, window, cx);
+                                        })),
+                                )
+                            })
                             .child(
                                 header_btn("code-copy")
                                     .child(icon("copy", 16., Theme::icon()))
@@ -2295,7 +2477,7 @@ fn code_block_feishu(&self, b: &Block, lang: &str, wrap: bool, cx: &mut Context<
             )
             .child(fold_btn)
             .when(folded, |d| d.child(div().h(px(38.))))
-            .when(!folded, |d| {
+            .when(!folded && (diagram.is_none() || reveal), |d| {
                 d.child(
                     div()
                         .pt(px(40.))
@@ -2313,18 +2495,19 @@ fn code_block_feishu(&self, b: &Block, lang: &str, wrap: bool, cx: &mut Context<
                                 .items_end()
                                 .font_family(theme::MONO_FONT)
                                 .text_size(px(14.))
-                                .line_height(px(22.))
+                                .line_height(px(line))
                                 .text_color(Theme::text_caption())
                                 .children(
                                     rows_per_line
                                         .iter()
                                         .enumerate()
-                                        .map(|(i, n)| div().h(px(22. * *n as f32)).child(format!("{}", i + 1))),
+                                        .map(|(i, n)| div().h(px(line * *n as f32)).child(format!("{}", i + 1))),
                                 ),
                         )
                         .child(self.code_column(id, wrap, el, 14.)),
                 )
             })
+            .children(diagram)
             .into_any_element()
     }
 }
@@ -2333,6 +2516,9 @@ impl R<'_> {
 fn children_of_feishu(&self, b: &Block, env: Env, cx: &mut Context<Editor>) -> Div {
 
         if b.children.is_empty() || b.folded || self.flat == Some(b.id) {
+            if b.children.is_empty() && !self.ghost && self.ed.drag_slot_at(Flow::In(b.id)) == Some(0) {
+                return div().pl(px(25.)).child(self.ed.slot_el());
+            }
             return div();
         }
         div().pl(px(25.)).mt(px(8.)).child(self.blocks(&b.children, Env { depth: env.depth + 1, width: env.width - 25., ..env }, cx))

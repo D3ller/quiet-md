@@ -2,6 +2,7 @@
 //! selection, caret and IME marked range. Layout results are written into a
 //! shared cache that the editor uses for hit-testing and caret navigation.
 
+use crate::editor::bidi;
 use crate::editor::core::Pos;
 use crate::editor::math;
 use crate::model::{Align, BlockId, Marks, RichText};
@@ -27,6 +28,8 @@ pub struct Row {
     pub base_dy: Pixels,
     /// x of the row start inside the unwrapped hard-line layout.
     pub x0: Pixels,
+    /// x of the row end there.
+    pub x1: Pixels,
     /// Horizontal offset from alignment.
     pub align_dx: Pixels,
 }
@@ -79,9 +82,20 @@ impl TextLayout {
 
     fn position_in_row(&self, ri: usize, index: usize) -> Point<Pixels> {
         let Some(r) = self.rows.get(ri) else { return self.bounds.origin };
-        let (start, line) = &self.lines[r.hard];
-        let x = line.unwrapped_layout.x_for_index(index.saturating_sub(*start)) - r.x0 + r.align_dx;
+        let x = self.x_in_row(r, index) - r.x0 + r.align_dx;
         point(self.bounds.left() + x, self.bounds.top() + r.y + r.base_dy)
+    }
+
+    /// x of the caret before block offset `index` in the hard-line layout of
+    /// row `r`. Right-to-left glyphs come in visual order (see `bidi`).
+    fn x_in_row(&self, r: &Row, index: usize) -> Pixels {
+        let (start, line) = &self.lines[r.hard];
+        let i = index.saturating_sub(*start);
+        let l = &line.unwrapped_layout;
+        if bidi::has_rtl(&line.text) && let Some(x) = bidi::x_for_index(l, &line.text, r.x0..r.x1, i) {
+            return x;
+        }
+        l.x_for_index(i)
     }
 
     /// Row `ri` is followed by another row of the same hard line.
@@ -161,7 +175,9 @@ impl TextLayout {
         let r = &self.rows[ri];
         let (start, line) = &self.lines[r.hard];
         let x = window_x - self.bounds.left() - r.align_dx + r.x0;
-        let ix = (start + line.unwrapped_layout.closest_index_for_x(x.max(px(0.)))).clamp(r.range.start, r.range.end);
+        let l = &line.unwrapped_layout;
+        let rtl = if bidi::has_rtl(&line.text) { bidi::index_for_x(l, &line.text, r.x0..r.x1, x) } else { None };
+        let ix = (start + rtl.unwrap_or_else(|| l.closest_index_for_x(x.max(px(0.))))).clamp(r.range.start, r.range.end);
         (ix, self.row_wraps(ri) && ix == r.range.end)
     }
 
@@ -177,18 +193,69 @@ impl TextLayout {
                 continue;
             }
             let (start, line) = &self.lines[r.hard];
-            let xa = line.unwrapped_layout.x_for_index(a - start) - r.x0 + r.align_dx;
-            let mut xb = line.unwrapped_layout.x_for_index(b - start) - r.x0 + r.align_dx;
+            let top = self.bounds.top() + r.y + r.base_dy;
+            let rect = |xa: Pixels, xb: Pixels| {
+                let (xa, xb) = (xa - r.x0 + r.align_dx, xb - r.x0 + r.align_dx);
+                Bounds::from_corners(point(self.bounds.left() + xa, top), point(self.bounds.left() + xb, top + self.line_height))
+            };
+            // Right-to-left text: the range may cover several pieces of the
+            // row, and the line ends on its left.
+            if bidi::has_rtl(&line.text) {
+                let l = &line.unwrapped_layout;
+                let mut parts = bidi::ranges_for(l, &line.text, r.x0..r.x1, a - start..b - start);
+                if parts.is_empty() {
+                    let x = self.x_in_row(r, a);
+                    parts.push((x, x));
+                }
+                if range.end > r.range.end && last_of_hard {
+                    if bidi::rtl_line(&line.text) {
+                        let first = parts.iter_mut().min_by(|p, q| f32::from(p.0).total_cmp(&f32::from(q.0))).unwrap();
+                        first.0 -= px(5.);
+                    } else {
+                        let last = parts.iter_mut().max_by(|p, q| f32::from(p.1).total_cmp(&f32::from(q.1))).unwrap();
+                        last.1 += px(5.);
+                    }
+                }
+                out.extend(parts.into_iter().map(|(xa, xb)| rect(xa, xb)));
+                continue;
+            }
+            let xa = line.unwrapped_layout.x_for_index(a - start);
+            let mut xb = line.unwrapped_layout.x_for_index(b - start);
             if range.end > r.range.end && last_of_hard {
                 xb += px(5.);
             }
-            out.push(Bounds::from_corners(
-                point(self.bounds.left() + xa, self.bounds.top() + r.y + r.base_dy),
-                point(self.bounds.left() + xb, self.bounds.top() + r.y + r.base_dy + self.line_height),
-            ));
+            out.push(rect(xa, xb));
         }
         out
     }
+}
+
+/// Each wrapped row's first byte and left x in the hard line's layout. The
+/// leftmost glyph of a right-to-left row is its last character, so there the
+/// row starts at the smallest byte offset drawn in it.
+fn row_starts(line: &WrappedLine) -> Vec<(usize, Pixels)> {
+    let layout = &line.unwrapped_layout;
+    let mut out = vec![(0, px(0.))];
+    for b in line.wrap_boundaries() {
+        let g = &layout.runs[b.run_ix].glyphs[b.glyph_ix];
+        out.push((g.index, g.position.x));
+    }
+    if out.len() > 1 && bidi::has_rtl(&line.text) {
+        let mut wraps = line.wrap_boundaries().iter().peekable();
+        let mut row = 0;
+        for (run_ix, run) in layout.runs.iter().enumerate() {
+            for (glyph_ix, g) in run.glyphs.iter().enumerate() {
+                if wraps.peek().is_some_and(|b| b.run_ix == run_ix && b.glyph_ix == glyph_ix) {
+                    wraps.next();
+                    row += 1;
+                }
+                if row > 0 {
+                    out[row].0 = out[row].0.min(g.index);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A single-line field's horizontal scroll: the caret stays 8pt inside the
@@ -232,12 +299,27 @@ pub struct TextSpec {
     pub italic: bool,
     /// Fonts by run instead (board text: Excalidraw's fonts, `board::fonts::runs`).
     pub font_runs: Option<FontRuns>,
+    /// Every line's ascent and descent in px instead of its fonts' (board
+    /// text: the board's own, so the baseline sits where the board draws it).
+    pub metrics: Option<(f32, f32)>,
+    /// Rows cut where these say instead of at the wrap width (board text:
+    /// where the board wraps it).
+    pub breaks: Option<Breaks>,
+    /// Drawn this far from where layout puts it: less than a device pixel,
+    /// which layout rounds positions to (board text: where the board's is).
+    pub shift: Point<Pixels>,
 }
+
+/// A hard line's rows as byte ranges; what lies between two rows (spaces
+/// dropped at a soft break) takes no room.
+pub type Breaks = Rc<dyn Fn(&str) -> Vec<Range<usize>>>;
 
 /// Cuts a span into runs by font (byte lengths).
 pub type FontRuns = Rc<dyn Fn(&str) -> Vec<(usize, Font)>>;
 
 impl TextSpec {
+    fn shifted(&self, b: Bounds<Pixels>) -> Bounds<Pixels> { Bounds::new(b.origin + self.shift, b.size) }
+
     /// The page body: 15pt, 1.25 × the natural line height.
     pub fn body() -> Self {
         TextSpec {
@@ -255,6 +337,9 @@ impl TextSpec {
             font: None,
             italic: false,
             font_runs: None,
+            metrics: None,
+            breaks: None,
+            shift: Point::default(),
         }
     }
 }
@@ -372,7 +457,7 @@ fn doc_geom(ix: usize, l: &crate::model::InlineDocLink, spec: &TextSpec, row_w: 
         None => (crate::settings::text("此文档已被删除").to_string(), None),
     };
     let font = Font {
-        family: theme::UI_FONT.into(),
+        family: theme::DOC_UI_FONT.into(),
         features: FontFeatures::default(),
         fallbacks: Some(FontFallbacks::from_fonts(vec!["PingFang SC".into(), "Apple Color Emoji".into()])),
         weight: if spec.weight.0 > 500. { spec.weight } else { FontWeight(500.) },
@@ -409,7 +494,7 @@ fn doc_geom(ix: usize, l: &crate::model::InlineDocLink, spec: &TextSpec, row_w: 
 fn reminder_geom(ix: usize, r: &crate::model::InlineReminder, spec: &TextSpec, window: &mut Window) -> EqGeom {
     let (fs, lh) = (spec.size, spec.line_height);
     let font = Font {
-        family: theme::UI_FONT.into(),
+        family: theme::DOC_UI_FONT.into(),
         features: FontFeatures::default(),
         fallbacks: Some(FontFallbacks::from_fonts(vec!["PingFang SC".into(), "Apple Color Emoji".into()])),
         weight: spec.weight,
@@ -444,7 +529,7 @@ fn reminder_geom(ix: usize, r: &crate::model::InlineReminder, spec: &TextSpec, w
 fn file_geom(ix: usize, f: &crate::model::FileBlock, spec: &TextSpec, row_w: f32, window: &mut Window) -> EqGeom {
     let (fs, lh) = (spec.size, spec.line_height);
     let font = Font {
-        family: theme::UI_FONT.into(),
+        family: theme::DOC_UI_FONT.into(),
         features: FontFeatures::default(),
         fallbacks: Some(FontFallbacks::from_fonts(vec!["PingFang SC".into(), "Apple Color Emoji".into()])),
         weight: spec.weight,
@@ -475,7 +560,7 @@ fn button_geom(ix: usize, b: &crate::model::InlineButton, editing: bool, spec: &
     let lh = spec.line_height;
     let wrap_lh = if heading { bh } else { lh };
     let font = Font {
-        family: theme::UI_FONT.into(),
+        family: theme::DOC_UI_FONT.into(),
         features: FontFeatures::default(),
         fallbacks: Some(FontFallbacks::from_fonts(vec!["PingFang SC".into(), "Apple Color Emoji".into()])),
         weight,
@@ -518,7 +603,7 @@ fn eq_geom(ix: usize, src: &str, fs: f32, row_w: f32, color: Hsla, eqno: u32, wi
         let error = parsed.is_some();
         let (label, tc) = if error { (crate::settings::text("无效公式"), Theme::text()) } else { (crate::settings::text("添加 LaTeX 公式"), Theme::text_caption()) };
         let font = Font {
-            family: theme::UI_FONT.into(),
+            family: theme::DOC_UI_FONT.into(),
             features: FontFeatures::default(),
             fallbacks: Some(FontFallbacks::from_fonts(vec!["PingFang SC".into()])),
             weight: FontWeight::NORMAL,
@@ -612,11 +697,12 @@ fn eq_geom(ix: usize, src: &str, fs: f32, row_w: f32, color: Hsla, eqno: u32, wi
 }
 
 fn font_for(spec: &TextSpec, m: &Marks) -> Font {
-    let family: SharedString = if spec.mono || m.code { theme::mono_font().into() } else if let Some(f) = spec.font { f.into() } else if spec.doc_font { theme::body_font().into() } else { theme::UI_FONT.into() };
+    let family: SharedString = if spec.mono || m.code { theme::mono_font().into() } else if let Some(f) = spec.font { f.into() } else if spec.doc_font { theme::body_font().into() } else { theme::ui_family().into() };
     Font {
         family,
         features: FontFeatures::default(),
-        fallbacks: Some(FontFallbacks::from_fonts(vec!["PingFang SC".into(), "Apple Color Emoji".into()])),
+        // a field drawn as the UI's own labels (`font` the UI's sans: a table's cell) falls back as they do
+        fallbacks: if spec.font == Some(theme::DOC_UI_FONT) { None } else { Some(FontFallbacks::from_fonts(vec!["PingFang SC".into(), "Apple Color Emoji".into()])) },
         weight: if m.bold { bold_weight() } else { spec.weight },
         style: if m.italic || spec.italic { FontStyle::Italic } else { FontStyle::Normal },
     }
@@ -632,7 +718,8 @@ fn span_color(spec: &TextSpec, m: &Marks) -> Hsla {
         return Theme::link();
     }
     let st = theme::style();
-    let own = if crate::settings::feishu() || spec.mono { None } else if m.code { st.color("code.color") } else if m.bold { st.color("strong.color") } else { None };
+    // `code`, then `strong`, then `em` (a bold italic run takes the bold colour).
+    let own = if spec.mono { None } else if m.code { st.color("code.color") } else if m.bold { st.color("strong.color") } else if m.italic { st.color("em.color") } else { None };
     let c = match m.text_color.as_ref().and_then(|c| theme::text_color(&c.0)) {
         Some(c) if spec.dim_marks => c.opacity(0.7),
         Some(c) => c,
@@ -642,9 +729,16 @@ fn span_color(spec: &TextSpec, m: &Marks) -> Hsla {
     if m.strike && !crate::settings::feishu() { c.opacity(c.a * 0.65) } else { c }
 }
 
-use crate::editor_ui::{CJK_PUNCT_FONT, is_cjk_punct};
+use crate::editor_ui::{cjk_punct_font, is_cjk_punct};
 
+/// A family the platform has: a missing one resolves to GPUI's last-resort
+/// face in its regular style, so quotes in bold or italic text lost theirs (#419).
+#[cfg(target_vendor = "apple")]
 const QUOTE_FONT: &str = "Helvetica Neue";
+#[cfg(target_os = "windows")]
+const QUOTE_FONT: &str = "Segoe UI";
+#[cfg(not(any(target_vendor = "apple", target_os = "windows")))]
+const QUOTE_FONT: &str = crate::theme::SYSTEM_FONT;
 
 /// Shaped in place of an equation's U+FFFC: same UTF-8 length, a glyph of
 /// the text font (so the line's ascent is unchanged).
@@ -673,6 +767,31 @@ fn is_quote(ch: char) -> bool {
     matches!(ch, '\u{2018}' | '\u{2019}' | '\u{201C}' | '\u{201D}')
 }
 
+/// #419: the curly quotes that belong to Chinese text, by byte offset: those
+/// right next to a Han character or Chinese punctuation, and the other one of
+/// their pair (`用“Quiet.md”打开`: both). They take the Chinese face, the rest
+/// stay Latin. A quote with no pair (an apostrophe) goes by its own neighbours.
+fn cjk_quotes(text: &str) -> Vec<usize> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let chinese = |j: Option<usize>| j.and_then(|j| chars.get(j)).is_some_and(|&(_, ch)| is_cjk(ch) || is_cjk_punct(ch));
+    let mut on: Vec<bool> = (0..chars.len()).map(|i| is_quote(chars[i].1) && (chinese(i.checked_sub(1)) || chinese(Some(i + 1)))).collect();
+    let (mut double, mut single) = (vec![], vec![]);
+    for (i, &(_, ch)) in chars.iter().enumerate() {
+        let open = match ch {
+            '\u{201C}' => { double.push(i); continue }
+            '\u{2018}' => { single.push(i); continue }
+            '\u{201D}' => double.pop(),
+            '\u{2019}' => single.pop(),
+            _ => continue,
+        };
+        if let Some(o) = open {
+            let both = on[o] || on[i];
+            (on[o], on[i]) = (both, both);
+        }
+    }
+    chars.iter().zip(on).filter(|(_, on)| *on).map(|(&(at, _), _)| at).collect()
+}
+
 pub fn build_runs(
     text: &RichText,
     spec: &TextSpec,
@@ -680,6 +799,7 @@ pub fn build_runs(
     highlight: Option<&Vec<crate::highlight::Span>>,
 ) -> Vec<TextRun> {
     let mut runs = vec![];
+    let chinese_quotes = if text.text.chars().any(is_quote) { cjk_quotes(&text.text) } else { vec![] };
     for (range, m) in text.spans() {
         // Split by the marked (IME) range and syntax highlight boundaries.
         let mut cuts = vec![range.start, range.end];
@@ -694,7 +814,8 @@ pub fn build_runs(
             }
         }
         // Curly quotes render in a Latin-width face (QUOTE_FONT) rather
-        // than the body face's full-width ones.
+        // than the body face's full-width ones, but in Chinese text in the
+        // Chinese one (`cjk_quotes`).
         for (i, ch) in text.text[range.clone()].char_indices() {
             if is_quote(ch) || is_cjk_punct(ch) {
                 cuts.push(range.start + i);
@@ -729,10 +850,20 @@ pub fn build_runs(
             };
             let mut font = font_for(spec, m);
             if !spec.mono && !m.code {
+                // A family the reader picked keeps the ones it draws itself.
+                let own = crate::fonts::own_glyphs(&font.family);
                 if text.text[a..b].chars().all(is_quote) {
-                    font.family = QUOTE_FONT.into();
-                } else if text.text[a..b].chars().all(is_cjk_punct) {
-                    font.family = CJK_PUNCT_FONT.into();
+                    // Cut one by one, so `a` is the quote.
+                    // In Chinese text the Chinese face's; without one (not
+                    // installed here), as in Latin text.
+                    match (chinese_quotes.binary_search(&a).is_ok(), own.cjk_punct, cjk_punct_font()) {
+                        (true, true, _) => {}
+                        (true, false, Some(f)) => font.family = f.into(),
+                        _ if !own.quotes => font.family = QUOTE_FONT.into(),
+                        _ => {}
+                    }
+                } else if !own.cjk_punct && text.text[a..b].chars().all(is_cjk_punct) && let Some(f) = cjk_punct_font() {
+                    font.family = f.into();
                 }
             }
             if hl_italic {
@@ -759,13 +890,6 @@ pub fn build_runs(
     runs
 }
 
-impl IntoElement for RichTextElement {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
 impl Element for RichTextElement {
     type RequestLayoutState = Rc<RefCell<Option<Prepared>>>;
     type PrepaintState = Prepaint;
@@ -788,13 +912,14 @@ impl Element for RichTextElement {
         let state: Rc<RefCell<Option<Prepared>>> = Rc::new(RefCell::new(None));
         let font_size = px(self.spec.size);
         let line_height = px(self.spec.line_height);
-        // Linux fallback fonts change during IME composition; keep the title baseline stable.
-        let title_metrics = if cfg!(target_os = "linux") && self.id == crate::editor::core::TITLE {
+        // Lines' ascent and descent when fixed: Linux fallback fonts change during IME
+        // composition, so the title keeps its font's; board text takes the board's (`TextSpec::metrics`).
+        let metrics = if cfg!(target_os = "linux") && self.id == crate::editor::core::TITLE {
             let ts = window.text_system();
             let id = ts.resolve_font(&font_for(&self.spec, &Marks::default()));
             // GPUI Linux font metrics use a signed descent; shaped line layouts use a positive distance.
             Some((ts.ascent(id, font_size), px(f32::from(ts.descent(id, font_size)).abs())))
-        } else { None };
+        } else { self.spec.metrics.map(|(a, d)| (px(a), px(d))) };
         let mut eq_src: Vec<(usize, ObjSrc)> = vec![];
         let (text, runs) = if self.text.is_empty() {
             match &self.placeholder {
@@ -863,6 +988,7 @@ impl Element for RichTextElement {
         let color = self.spec.color;
         let eq_counter = self.eq_counter;
         let spec = self.spec.clone();
+        let breaks = self.spec.breaks.clone();
         let mut style = Style::default();
         let fit = self.fit_content && !wrap;
         if fit { style.min_size.width = relative(1.).into(); style.flex_shrink = 0.; } else { style.size.width = relative(1.).into() }
@@ -881,7 +1007,7 @@ impl Element for RichTextElement {
             {
                 return size(known.width.unwrap_or(if fit { p.width } else { px(0.) }), p.height);
             }
-            let custom = spacing != px(0.) || !eq_src.is_empty();
+            let custom = spacing != px(0.) || !eq_src.is_empty() || breaks.is_some();
             let mut lines = window
                 .text_system()
                 .shape_text(text.clone(), font_size, &runs, if custom { None } else { wrap_width }, None)
@@ -910,10 +1036,13 @@ impl Element for RichTextElement {
             for mut l in lines.drain(..) {
                 let len = l.len();
                 let line_eqs: Vec<&EqGeom> = eqs.iter().map(|e| &**e).filter(|e| e.ix >= start && e.ix < start + len).collect();
-                if custom {
+                if let Some(b) = &breaks {
+                    let rows = b(&l.text);
+                    break_line(&mut l, &rows);
+                } else if custom {
                     adjust_line(&mut l, spacing, &line_eqs, start, wrap_width);
                 }
-                if let Some((ascent, descent)) = title_metrics {
+                if let Some((ascent, descent)) = metrics {
                     let src = &l.unwrapped_layout;
                     let layout = LineLayout { font_size: src.font_size, width: src.width, ascent, descent, runs: src.runs.clone(), len: src.len };
                     let wrapped = WrappedLineLayout { unwrapped_layout: std::sync::Arc::new(layout), wrap_boundaries: l.wrap_boundaries().into(), wrap_width: l.wrap_width };
@@ -923,10 +1052,7 @@ impl Element for RichTextElement {
                 // Row heights: the line box grows to contain equation boxes.
                 let layout = &l.unwrapped_layout;
                 let base = (line_height - layout.ascent - layout.descent) / 2. + layout.ascent;
-                let mut cuts: Vec<usize> = vec![0];
-                for b in l.wrap_boundaries() {
-                    cuts.push(layout.runs[b.run_ix].glyphs[b.glyph_ix].index);
-                }
+                let mut cuts: Vec<usize> = row_starts(&l).into_iter().map(|r| r.0).collect();
                 cuts.push(len + 1);
                 for c in cuts.windows(2) {
                     let (mut top, mut bottom) = (px(0.), line_height);
@@ -965,12 +1091,16 @@ impl Element for RichTextElement {
         window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
+        let bounds = self.spec.shifted(bounds);
         let Some(p) = state.borrow_mut().take() else { return Prepaint { placed: vec![], sx: px(0.) } };
         // Single-line fields scroll horizontally; wrapped ones never do.
         let sx = match &self.scroll {
             Some(cell) if !self.spec.wrap && p.lines.len() == 1 => {
                 let (start, line) = &p.lines[0];
-                let caret_x = line.unwrapped_layout.x_for_index(self.caret.unwrap_or(0).saturating_sub(*start));
+                let i = self.caret.unwrap_or(0).saturating_sub(*start);
+                let l = &line.unwrapped_layout;
+                let rtl = if bidi::has_rtl(&line.text) { bidi::x_for_index(l, &line.text, px(0.)..l.width, i) } else { None };
+                let caret_x = rtl.unwrap_or_else(|| l.x_for_index(i));
                 let s = hscroll(line.unwrapped_layout.width, caret_x, bounds.size.width, cell.get());
                 cell.set(s);
                 s
@@ -991,24 +1121,23 @@ impl Element for RichTextElement {
         let mut heights = p.rows.iter();
         for (hi, (start, line)) in p.lines.iter().enumerate() {
             let layout = &line.unwrapped_layout;
-            let mut bounds_ix: Vec<(usize, Pixels)> = vec![(0, px(0.))];
-            for b in line.wrap_boundaries() {
-                let g = &layout.runs[b.run_ix].glyphs[b.glyph_ix];
-                bounds_ix.push((g.index, g.position.x));
-            }
+            let mut bounds_ix = row_starts(line);
             bounds_ix.push((line.len(), layout.width));
+            // A line that reads right to left keeps the default (left)
+            // alignment against the right edge, as the platform text views do.
+            let align = if self.align == Align::Left && bidi::rtl_line(&line.text) { Align::Right } else { self.align };
             for w in bounds_ix.windows(2) {
                 let (a, xa) = w[0];
                 let (b, xb) = w[1];
                 let width = xb - xa;
-                let align_dx = match self.align {
+                let align_dx = match align {
                     Align::Left => px(0.),
                     Align::Center => ((bounds.size.width - width) / 2.).max(px(0.)),
                     Align::Right => (bounds.size.width - width).max(px(0.)),
                 };
                 let (ra, rb) = if showing_placeholder { (0, 0) } else { (start + a, start + b) };
                 let (h, base_dy) = heights.next().copied().unwrap_or((lh, px(0.)));
-                rows.push(Row { range: ra..rb, hard: hi, y, h, base_dy, x0: xa, align_dx });
+                rows.push(Row { range: ra..rb, hard: hi, y, h, base_dy, x0: xa, x1: xb, align_dx });
                 y += h;
             }
         }
@@ -1017,9 +1146,8 @@ impl Element for RichTextElement {
         for e in p.eqs {
             let ri = layout.row_for(e.ix);
             let Some(r) = layout.rows.get(ri) else { continue };
-            let (start, line) = &layout.lines[r.hard];
-            let l = &line.unwrapped_layout;
-            let x = l.x_for_index(e.ix - start) - r.x0 + r.align_dx;
+            let l = &layout.lines[r.hard].1.unwrapped_layout;
+            let x = layout.x_in_row(r, e.ix) - r.x0 + r.align_dx;
             let base = (lh - l.ascent - l.descent) / 2. + l.ascent;
             let line_top = bounds.top() + r.y + r.base_dy;
             let origin = point(text_origin.x + x, if e.ext.is_some() { line_top } else { line_top + base - px(EQ_MIDDLE * self.spec.size) });
@@ -1047,10 +1175,14 @@ impl Element for RichTextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let bounds = self.spec.shifted(bounds);
         let cache = self.cache.borrow();
         let Some(layout) = cache.get(&self.id) else { return };
         let lh = layout.line_height;
-        let gpui_align = match self.align {
+        // Per hard line: one that reads right to left sits against the right
+        // edge (see `prepaint`).
+        let gpui_align = |line: &WrappedLine| match self.align {
+            Align::Left if bidi::rtl_line(&line.text) => TextAlign::Right,
             Align::Left => TextAlign::Left,
             Align::Center => TextAlign::Center,
             Align::Right => TextAlign::Right,
@@ -1064,7 +1196,7 @@ impl Element for RichTextElement {
                 }
                 for r in layout.rects_for(range) {
                     let inset = if crate::settings::feishu() { px(3.) } else { ((r.size.height - px(self.spec.size * 1.32)) / 2.).max(px(0.)) };
-                    let (pad, radius) = if crate::settings::feishu() { (2., 4.) } else { (theme::style().num("code.pad"), theme::style().num("code.radius")) };
+                    let (pad, radius) = (theme::style().num("code.pad"), theme::style().num("code.radius"));
                     let r = Bounds::from_corners(point(r.left() - px(pad), r.top() + inset), point(r.right() + px(pad), r.bottom() - inset));
                     window.paint_quad(
                         quad(r, px(radius), if crate::settings::feishu() { Theme::bg_overlay() } else { Theme::code_chip() }, px(1.), if crate::settings::feishu() { Theme::line_border() } else { Theme::code_chip_border() }, BorderStyle::Solid),
@@ -1078,7 +1210,7 @@ impl Element for RichTextElement {
         let o = point(bounds.left() + dx - sx, bounds.top());
         for (hi, (_, line)) in layout.lines.iter().enumerate() {
             let tops: Vec<Pixels> = layout.rows.iter().filter(|r| r.hard == hi).map(|r| r.y + r.base_dy).collect();
-            let _ = line.paint_background_rows(o, lh, &tops, gpui_align, Some(bounds), window, cx);
+            let _ = line.paint_background_rows(o, lh, &tops, gpui_align(line), Some(bounds), window, cx);
         }
         if let Some(sel) = &self.selection {
             let rects = if self.text.is_empty() {
@@ -1128,7 +1260,7 @@ impl Element for RichTextElement {
         }
         for (hi, (_, line)) in layout.lines.iter().enumerate() {
             let tops: Vec<Pixels> = layout.rows.iter().filter(|r| r.hard == hi).map(|r| r.y + r.base_dy).collect();
-            let _ = line.paint_rows(o, lh, &tops, gpui_align, Some(bounds), window, cx);
+            let _ = line.paint_rows(o, lh, &tops, gpui_align(line), Some(bounds), window, cx);
         }
         for eq in prepaint.placed.iter() {
             let o = eq.origin;
@@ -1145,12 +1277,13 @@ impl Element for RichTextElement {
                 EqBody::Reminder { .. } => self.paint_reminder(eq, window, cx),
                 EqBody::Text { line, at, icon } => {
                     let top = o.y + px(at[1]) - line.ascent;
-                    let _ = line.paint(point(o.x + px(at[0]), top), line.ascent + line.descent, window, cx);
+                    let _ = line.paint(point(o.x + px(at[0]), top), line.ascent + line.descent, TextAlign::Left, None, window, cx);
                     if let Some(i) = icon {
                         let b = Bounds::new(point(o.x + px(i[0]), o.y + px(i[1])), size(px(14.), px(14.)));
                         let _ = window.paint_svg(
                             b,
                             "editor-icons/equation-error.svg".into(),
+                            None,
                             TransformationMatrix::unit(),
                             theme::c(0xff9200),
                             cx,
@@ -1221,7 +1354,7 @@ impl RichTextElement {
         let shadows = if lifted { crate::editor::button::shadow_s4() } else { crate::editor::button::shadow_s1() };
         // Content stays crisp: buttons in the text round at 5.
         let radius = px(5.);
-        window.paint_shadows(v, Corners::all(radius), &shadows);
+        window.paint_drop_shadows(v, Corners::all(radius), &shadows);
         window.paint_quad(fill(v, bg).corner_radii(radius));
         // A done to-do: `.todo-line-through .docx-button-component` draws
         // a 1.6px `--icon-n2` line at 55% behind the label; `opacity: .7`.
@@ -1234,7 +1367,7 @@ impl RichTextElement {
         let line = window.text_system().shape_line(line.text.clone(), line.font_size, &[run], None);
         let clip = Bounds::new(point(v.left() + px(*pad), v.top()), size((v.size.width - px(pad * 2.)).max(px(0.)), v.size.height));
         window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
-            let _ = line.paint(point(v.left() + px(*pad), v.top()), px(*bh), window, cx);
+            let _ = line.paint(point(v.left() + px(*pad), v.top()), px(*bh), TextAlign::Left, None, window, cx);
         });
     }
 
@@ -1253,7 +1386,7 @@ impl RichTextElement {
         let line = window.text_system().shape_line(line.text.clone(), line.font_size, &[run], None);
         let clip = Bounds::new(point(o.x + px(*text_x), v.top()), size((v.size.width - px(text_x + 2.)).max(px(0.)), v.size.height));
         window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
-            let _ = line.paint(point(o.x + px(*text_x), v.top()), v.size.height, window, cx);
+            let _ = line.paint(point(o.x + px(*text_x), v.top()), v.size.height, TextAlign::Left, None, window, cx);
         });
     }
 
@@ -1272,12 +1405,12 @@ impl RichTextElement {
         let ib = Bounds::new(point(o.x + px(icon[0]), o.y + px(icon[1])), size(px(icon[2]), px(icon[2])));
         match emoji {
             Some(e) => {
-                let _ = e.paint(point(ib.origin.x, v.top()), v.size.height, window, cx);
+                let _ = e.paint(point(ib.origin.x, v.top()), v.size.height, TextAlign::Left, None, window, cx);
             }
             None => {
                 let c = if *deleted { Theme::text_disabled() } else { Theme::primary_500() };
-                let _ = window.paint_svg(ib, "editor-icons/doc-blue.svg".into(), TransformationMatrix::unit(), c, cx);
-                let _ = window.paint_svg(ib, "editor-icons/doc-blue-lines.svg".into(), TransformationMatrix::unit(), Theme::bg_body(), cx);
+                let _ = window.paint_svg(ib, "editor-icons/doc-blue.svg".into(), None, TransformationMatrix::unit(), c, cx);
+                let _ = window.paint_svg(ib, "editor-icons/doc-blue-lines.svg".into(), None, TransformationMatrix::unit(), Theme::bg_body(), cx);
             }
         }
         let color = if *deleted { Theme::text_disabled() } else if hovered { Theme::link_hover() } else { Theme::link() };
@@ -1285,7 +1418,7 @@ impl RichTextElement {
         let line = window.text_system().shape_line(line.text.clone(), line.font_size, &[run], None);
         let clip = Bounds::new(point(o.x + px(*text_x), v.top()), size((v.size.width - px(text_x + 2.)).max(px(0.)), v.size.height));
         window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
-            let _ = line.paint(point(o.x + px(*text_x), v.top()), v.size.height, window, cx);
+            let _ = line.paint(point(o.x + px(*text_x), v.top()), v.size.height, TextAlign::Left, None, window, cx);
         });
     }
 
@@ -1299,9 +1432,9 @@ impl RichTextElement {
         let o = eq.origin;
         let ib = Bounds::new(point(o.x + px(icon[0]), o.y + px(icon[1])), size(px(icon[2]), px(icon[2])));
         let path = if *filled { "editor-icons/reminder-filled.svg" } else { "editor-icons/reminder.svg" };
-        let _ = window.paint_svg(ib, path.into(), TransformationMatrix::unit(), *icon_color, cx);
+        let _ = window.paint_svg(ib, path.into(), None, TransformationMatrix::unit(), *icon_color, cx);
         let lh = px(self.spec.line_height);
-        let _ = line.paint(point(o.x + px(*text_x), o.y), lh, window, cx);
+        let _ = line.paint(point(o.x + px(*text_x), o.y), lh, TextAlign::Left, None, window, cx);
     }
 
     /// Pointer cursor, hover and `:active` repaints for equation views.
@@ -1415,6 +1548,44 @@ fn adjust_line(line: &mut WrappedLine, ls: Pixels, eqs: &[&EqGeom], start: usize
         wrap_boundaries: wraps.into(),
         wrap_width,
     });
+}
+
+/// Cuts a line into `rows` (`break_rows`).
+fn break_line(line: &mut WrappedLine, rows: &[Range<usize>]) {
+    let (layout, wraps) = break_rows(&line.unwrapped_layout, rows);
+    let wrapped: &mut std::sync::Arc<WrappedLineLayout> = line;
+    *wrapped = std::sync::Arc::new(WrappedLineLayout { unwrapped_layout: std::sync::Arc::new(layout), wrap_boundaries: wraps.into(), wrap_width: None });
+}
+
+/// A line cut into `rows`: wrap boundaries where each starts, and what lies
+/// between two rows moved to the end of the first with no width (as the
+/// board drops it), so rows align as the board draws them.
+fn break_rows(src: &LineLayout, rows: &[Range<usize>]) -> (LineLayout, Vec<WrapBoundary>) {
+    let x_at = |ix: usize| src.runs.iter().flat_map(|r| r.glyphs.iter()).find(|g| g.index >= ix).map_or(src.width, |g| g.position.x);
+    // (gap, width dropped before it)
+    let mut gaps = vec![];
+    let mut dropped = px(0.);
+    for w in rows.windows(2) {
+        let gap = w[0].end..w[1].start;
+        gaps.push((gap.clone(), dropped));
+        dropped += x_at(gap.end) - x_at(gap.start);
+    }
+    let moved = |ix: usize, x: Pixels| match gaps.iter().rev().find(|(g, _)| g.start <= ix) {
+        Some((g, d)) if ix < g.end => x_at(g.start) - *d,
+        Some((g, d)) => x - *d - (x_at(g.end) - x_at(g.start)),
+        None => x,
+    };
+    let runs: Vec<ShapedRun> = src
+        .runs
+        .iter()
+        .map(|r| ShapedRun { font_id: r.font_id, glyphs: r.glyphs.iter().map(|g| { let mut g = g.clone(); g.position.x = moved(g.index, g.position.x); g }).collect() })
+        .collect();
+    let mut wraps = vec![];
+    for r in rows.iter().skip(1) {
+        let at = runs.iter().enumerate().flat_map(|(ri, run)| run.glyphs.iter().enumerate().map(move |(gi, g)| (ri, gi, g.index))).find(|g| g.2 >= r.start);
+        if let Some((run_ix, glyph_ix, _)) = at { wraps.push(WrapBoundary { run_ix, glyph_ix }); }
+    }
+    (LineLayout { font_size: src.font_size, width: src.width - dropped, ascent: src.ascent, descent: src.descent, runs, len: src.len }, wraps)
 }
 
 fn is_cjk(ch: char) -> bool {
@@ -1542,14 +1713,134 @@ mod wrap_tests {
     }
 }
 
+#[cfg(test)]
+mod quote_tests {
+    use super::cjk_quotes;
+
+    /// The quotes `cjk_quotes` gives the Chinese face, as the text with those
+    /// marked `^` (the others `.`): everything else drops out.
+    fn marks(text: &str) -> String {
+        let on = cjk_quotes(text);
+        text.char_indices().filter(|(_, ch)| super::is_quote(*ch)).map(|(at, _)| if on.contains(&at) { '^' } else { '.' }).collect()
+    }
+
+    #[test]
+    fn quotes_in_chinese_text_take_the_chinese_face() {
+        // Next to a Han character, on either side, or Chinese punctuation.
+        assert_eq!(marks("他说“好”。"), "^^");
+        assert_eq!(marks("说：“Hello world”"), "^^", "a pair goes together: the closing one has only Latin around it");
+        assert_eq!(marks("用“Quiet.md”打开"), "^^", "English inside, Chinese outside");
+        assert_eq!(marks("“好”"), "^^", "the start and end of a paragraph");
+        assert_eq!(marks("“Hello”你好"), "^^", "one side is enough");
+        // Nested: each pair by its own neighbours.
+        assert_eq!(marks("他说：“她说‘好’。”"), "^^^^");
+        assert_eq!(marks("他说：“‘Hi’ there”"), "^..^", "the inner pair has only quotes and Latin around it");
+        // Latin on both sides stays Latin.
+        assert_eq!(marks("He said “hello” to ‘me’."), "....");
+        assert_eq!(marks("“Hello”"), "..");
+        assert_eq!(marks("中文 “Hello” 中文"), "..", "a space between is not next to");
+        // An apostrophe has no pair: its own neighbours decide.
+        assert_eq!(marks("it’s 中文"), ".");
+        assert_eq!(marks("中’s"), "^");
+        assert_eq!(marks("‘it’s’ 好"), "...", "the apostrophe closes the pair; the last one is alone");
+        // Unpaired openings and closings.
+        assert_eq!(marks("“好"), "^");
+        assert_eq!(marks("Hi” 好”"), ".^", "unpaired closings go by their own neighbours");
+        assert_eq!(marks("plain text"), "");
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
+    /// Rows cut where the board cuts them: the spaces dropped at a break
+    /// take no room, so a row is as wide as the board's line.
+    #[test]
+    fn rows_break_where_given() {
+        use gpui::{FontId, GlyphId, LineLayout, ShapedGlyph, ShapedRun, WrapBoundary, point, px};
+        // "ab  cd e": 10pt a glyph
+        let text = "ab  cd e";
+        let glyphs = text.char_indices().map(|(i, _)| ShapedGlyph { id: GlyphId(i as u32), position: point(px(i as f32 * 10.), px(0.)), index: i, is_emoji: false }).collect();
+        let src = LineLayout { font_size: px(10.), width: px(80.), ascent: px(8.), descent: px(2.), runs: vec![ShapedRun { font_id: FontId(0), glyphs }], len: text.len() };
+        let (l, wraps) = super::break_rows(&src, &[0..2, 4..6, 7..8]);
+        assert_eq!(wraps, vec![WrapBoundary { run_ix: 0, glyph_ix: 4 }, WrapBoundary { run_ix: 0, glyph_ix: 7 }]);
+        let xs: Vec<f32> = l.runs[0].glyphs.iter().map(|g| f32::from(g.position.x)).collect();
+        // the two spaces sit at the end of "ab", "cd" right after them, then " " at its end, "e"
+        assert_eq!(xs, vec![0., 10., 20., 20., 20., 30., 40., 40.]);
+        assert_eq!(l.width, px(50.));
+        // rows as wide as the board's lines: "ab", "cd", "e"
+        let ends = [px(20.), px(40.), l.width];
+        let starts: Vec<f32> = std::iter::once(0.).chain(wraps.iter().map(|w| xs[w.glyph_ix])).collect();
+        assert_eq!(starts.iter().zip(ends).map(|(a, b)| f32::from(b) - a).collect::<Vec<_>>(), vec![20., 20., 10.]);
+    }
+
     /// Editor text shapes CJK through CoreText's PingFang fallback, while CJK
     /// punctuation loads the PingFang SC family (`CJK_PUNCT_FONT`): both must
     /// keep drawing the right glyphs.
+    ///
+    /// CoreText's fallback copy of PingFang SC shares its PostScript name with
+    /// the PingFang SC family but not its glyph table (vendor patch
+    /// fallback-font-identity). Shapes the text in the system font before and
+    /// after loading that family, and checks every glyph against its face.
     #[test]
     fn cjk_fallback_glyphs() {
-        gpui::check_fallback_glyphs("周末规划一背景本季度目标").unwrap();
+        use gpui::{FontFallbacks, FontRun, PlatformTextSystem, px};
+        let text = "周末规划一背景本季度目标";
+        let fonts = gpui_apple::AppleTextSystem::new();
+        let mut ui = gpui::font(".SystemUIFont");
+        ui.fallbacks = Some(FontFallbacks::from_fonts(vec!["PingFang SC".into()]));
+        let font_id = fonts.font_id(&ui).unwrap();
+        for pass in 0..2 {
+            if pass == 1 { fonts.font_id(&gpui::font("PingFang SC")).unwrap(); }
+            let layout = fonts.layout_line(text, px(16.), &[FontRun { font_id, len: text.len() }]);
+            for run in &layout.runs {
+                for g in &run.glyphs {
+                    let ch = text[g.index..].chars().next().unwrap_or_default();
+                    assert_eq!(fonts.glyph_for_char(run.font_id, ch), Some(g.id), "{ch:?} drawn from the wrong face (pass {pass})");
+                }
+            }
+        }
+    }
+
+    /// The face CoreText falls back to for a CJK character is kept and given
+    /// to later lines (vendor patch reuse-coretext-fonts). Those lines
+    /// must come out exactly as CoreText's own fallback has them on a fresh
+    /// text system: the same glyphs, places and outlines (bold staying bold
+    /// after regular text kept its faces), across runs of alternating sizes.
+    #[test]
+    fn kept_cjk_fallbacks_shape_like_coretext() {
+        use gpui::{FontRun, FontWeight, PlatformTextSystem, px};
+        let text = "他说“好”。用 Quiet.md 打开（文件），再按「保存」：完成！";
+        let split = text.char_indices().nth(9).unwrap().0;
+        let shape = |fonts: &gpui_apple::AppleTextSystem, weight, parts: usize| {
+            let id = fonts.font_id(&gpui::Font { weight, ..gpui::font(".SystemUIFont") }).unwrap();
+            let runs = if parts == 1 { vec![FontRun { font_id: id, len: text.len() }] } else { vec![FontRun { font_id: id, len: split }, FontRun { font_id: id, len: text.len() - split }] };
+            let layout = fonts.layout_line(text, px(16.), &runs);
+            layout.runs.iter().flat_map(|r| r.glyphs.iter().map(move |g| (g.id, g.index, g.position, fonts.glyph_outline(r.font_id, g.id)))).collect::<Vec<_>>()
+        };
+        let kept = gpui_apple::AppleTextSystem::new();
+        for weight in [FontWeight::NORMAL, FontWeight::BOLD] {
+            for parts in [1, 2] {
+                let fresh = shape(&gpui_apple::AppleTextSystem::new(), weight, parts);
+                for pass in 0..2 {
+                    assert!(shape(&kept, weight, parts) == fresh, "{weight:?}, {parts} runs, pass {pass}");
+                }
+            }
+        }
+    }
+
+    /// #419: curly quotes are drawn in `QUOTE_FONT` whatever the run's weight
+    /// and style, so it must be a family the platform has: a missing one
+    /// resolves every weight and style to one regular fallback face.
+    #[test]
+    fn quote_font_keeps_bold_and_italic() {
+        use gpui::{FontStyle, FontWeight};
+        let ts = gpui::TextSystem::new(std::sync::Arc::new(gpui_apple::AppleTextSystem::new()));
+        let id = |family: &str, weight, style| ts.resolve_font(&gpui::Font { weight, style, ..gpui::font(family.to_string()) });
+        for family in [super::QUOTE_FONT, "No Such Family"] {
+            let regular = id(family, FontWeight::NORMAL, FontStyle::Normal);
+            let differ = regular != id(family, FontWeight::BOLD, FontStyle::Normal) && regular != id(family, FontWeight::NORMAL, FontStyle::Italic);
+            assert_eq!(differ, family == super::QUOTE_FONT, "{family}");
+        }
     }
 
     #[test]

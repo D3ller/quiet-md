@@ -5,7 +5,7 @@ use crate::{app::Workspace, settings::tr, theme::Theme};
 
 pub struct Shortcuts { base: Vec<KeyBinding>, custom: BTreeMap<String, String> }
 impl Global for Shortcuts {}
-fn path() -> std::path::PathBuf { crate::store::Store::internal_dir().join("shortcuts.json") }
+fn path() -> std::path::PathBuf { crate::store::Store::settings_dir().join("shortcuts.json") }
 /// The system-wide quick note hotkey unless the user picked another.
 pub const GLOBAL_DEFAULT: &str = "alt-space";
 pub fn global_key() -> String { saved("global").unwrap_or_else(|| GLOBAL_DEFAULT.into()) }
@@ -14,28 +14,48 @@ pub const LAST_ID: &str = "global-last";
 pub const LAST_DEFAULT: &str = "cmd-alt-space";
 pub fn last_key() -> String { saved(LAST_ID).unwrap_or_else(|| LAST_DEFAULT.into()) }
 fn saved(id: &str) -> Option<String> {
-    std::fs::read(path()).ok().and_then(|b| serde_json::from_slice::<BTreeMap<String,String>>(&b).ok()).and_then(|m| m.get(id).cloned())
+    fdl_core::vfs::read(path()).ok().and_then(|b| serde_json::from_slice::<BTreeMap<String,String>>(&b).ok()).and_then(|m| m.get(id).cloned())
 }
 /// The system-wide hotkeys: one stroke, kept apart from the app's.
 fn is_global(id: &str) -> bool { id == "global" || id == LAST_ID }
+/// The host OS, the way GPUI spells keystrokes for it ("cmd-", "win-", "super-").
+pub const HOST_OS: OperatingSystem = if cfg!(target_os = "macos") { OperatingSystem::Mac } else if cfg!(target_os = "windows") { OperatingSystem::Windows } else { OperatingSystem::Linux };
+pub fn parse_key(stroke: &str) -> Result<Keystroke, InvalidKeystrokeError> { Keystroke::parse_with_os(stroke, HOST_OS) }
+fn unparse(k: &impl AsKeystroke) -> String { k.as_keystroke().unparse(HOST_OS) }
+/// Mac key conventions (⌘ bindings and hints): macOS, or the web build in a
+/// Mac browser.
+pub fn mac() -> bool {
+    #[cfg(target_family = "wasm")] {
+        static MAC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *MAC.get_or_init(|| web_sys::window().map(|w| w.navigator()).is_some_and(|n| n.platform().is_ok_and(|p| p.starts_with("Mac")) || n.user_agent().is_ok_and(|a| a.contains("Mac OS X") && !a.contains("Mobile"))))
+    }
+    #[cfg(not(target_family = "wasm"))] { cfg!(target_vendor = "apple") }
+}
+
 pub fn init(cx: &mut App) {
-    let base = cx.key_bindings().borrow().bindings().cloned().collect::<Vec<_>>();
+    // First launch runs this twice (its pages, then `main::start`): by then the
+    // bound keys are PC-mapped and customized, and mapping ctrl-a again would
+    // drop 全选 as Cocoa's line start. Keep the built-in keys read the first time.
     #[cfg(not(target_os = "macos"))]
-    let base = base.into_iter().filter_map(pc_binding).collect();
-    let custom = std::fs::read(path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let again = cx.has_global::<Shortcuts>();
+    let base = match cx.try_global::<Shortcuts>() { Some(s) => s.base.clone(), None => cx.key_bindings().borrow().bindings().cloned().collect::<Vec<_>>() };
+    #[cfg(not(target_os = "macos"))]
+    let base = if mac() || again { base } else { base.into_iter().filter_map(pc_binding).collect() };
+    let custom = fdl_core::vfs::read(path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     cx.set_global(Shortcuts { base, custom });
     rebuild(cx);
 }
 
 #[cfg(any(test, not(target_os = "macos")))]
 fn pc_binding(binding: KeyBinding) -> Option<KeyBinding> {
-    let keys = binding.keystrokes().iter().map(|k| k.unparse().replace("win-", "cmd-").replace("super-", "cmd-")).collect::<Vec<_>>().join(" ");
+    let keys = binding.keystrokes().iter().map(|k| unparse(k).replace("win-", "cmd-").replace("super-", "cmd-")).collect::<Vec<_>>().join(" ");
     // Cocoa's control-key navigation conflicts with PC editing shortcuts.
     if matches!(keys.as_str(), "ctrl-a" | "ctrl-b" | "ctrl-d" | "ctrl-e" | "ctrl-f" | "ctrl-h" | "ctrl-n" | "ctrl-p" | "ctrl-backspace") { return None; }
     // Ctrl+Backspace deletes a word on PC platforms; do not override it with macOS line deletion.
     if keys == "cmd-backspace" { return None; }
-    // Ctrl+Shift+C is 行内代码 there, so 复制为 Markdown takes Alt as well.
-    let keys = if binding.action().name().ends_with("::InlineCode") { "ctrl-shift-c".to_string() } else if binding.action().name().ends_with("::CopyMarkdown") { "ctrl-alt-shift-c".to_string() } else { keys.split(' ').map(|key| match key {
+    // Ctrl+Shift+C is 行内代码 there, so 复制为 Markdown takes M. Not Ctrl+Alt:
+    // Windows reads Ctrl+Alt as AltGr, which types a letter on many layouts (#290).
+    let keys = if binding.action().name().ends_with("::InlineCode") { "ctrl-shift-c".to_string() } else if binding.action().name().ends_with("::CopyMarkdown") { "ctrl-shift-m".to_string() } else { keys.split(' ').map(|key| match key {
         "cmd-left" => "home".into(), "cmd-right" => "end".into(),
         "cmd-shift-left" => "shift-home".into(), "cmd-shift-right" => "shift-end".into(),
         "cmd-up" => "ctrl-home".into(), "cmd-down" => "ctrl-end".into(),
@@ -43,12 +63,18 @@ fn pc_binding(binding: KeyBinding) -> Option<KeyBinding> {
         "alt-left" | "alt-right" | "alt-shift-left" | "alt-shift-right" | "alt-backspace" | "alt-delete" => key.replacen("alt-", "ctrl-", 1),
         _ => key.replace("cmd-", "ctrl-"),
     }).collect::<Vec<String>>().join(" ") };
-    KeyBinding::load(&keys, binding.action().boxed_clone(), binding.predicate(), false, binding.action_input(), &DummyKeyboardMapper).ok()
+    load(&keys, &binding)
+}
+
+/// `keys` for `like`'s action and context, parsed as written: no keyboard
+/// layout mapping.
+fn load(keys: &str, like: &KeyBinding) -> Option<KeyBinding> {
+    KeyBinding::load_unmapped(keys, like.action().boxed_clone(), like.predicate(), like.action_input(), HOST_OS).ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::pc_binding;
+    use super::{pc_binding, unparse};
     use gpui::KeyBinding;
     #[test]
     fn pc_word_deletion_has_no_line_deletion_collision() {
@@ -58,7 +84,7 @@ mod tests {
             (KeyBinding::new("alt-delete", DeleteWordForward, Some("Editor")), "ctrl-delete"),
         ] {
             let mapped = pc_binding(binding).unwrap();
-            assert_eq!(mapped.keystrokes()[0].unparse(), expected);
+            assert_eq!(unparse(&mapped.keystrokes()[0]), expected);
         }
         assert!(pc_binding(KeyBinding::new("cmd-backspace", DeleteToLineStart, Some("Editor"))).is_none());
         assert!(pc_binding(KeyBinding::new("ctrl-backspace", Backspace, Some("Editor"))).is_none());
@@ -68,9 +94,11 @@ mod tests {
         use crate::editor::keymap::{Copy, InlineCode};
         let copy = pc_binding(KeyBinding::new("cmd-c", Copy, Some("Editor"))).unwrap();
         let code = pc_binding(KeyBinding::new("cmd-ctrl-c", InlineCode, Some("Editor"))).unwrap();
-        assert_eq!(copy.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>(), ["ctrl-c"]);
-        assert_eq!(code.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>(), ["ctrl-shift-c"]);
+        assert_eq!(copy.keystrokes().iter().map(unparse).collect::<Vec<_>>(), ["ctrl-c"]);
+        assert_eq!(code.keystrokes().iter().map(unparse).collect::<Vec<_>>(), ["ctrl-shift-c"]);
         assert_ne!(copy.keystrokes(), code.keystrokes());
+        let md = pc_binding(KeyBinding::new("cmd-shift-c", crate::editor::keymap::CopyMarkdown, Some("Editor"))).unwrap();
+        assert_eq!(md.keystrokes().iter().map(unparse).collect::<Vec<_>>(), ["ctrl-shift-m"]);
     }
 }
 /// Mac key notation (⌘ ⌥ ⇧ ⌃, "⌘ + Shift + 7") as Windows writes it, the way
@@ -133,7 +161,7 @@ fn first_group_hint() -> &'static str {
 /// A UI label's keys for this platform: `windows_keys` on non-macOS platforms (cached,
 /// labels are `'static`), the text itself elsewhere.
 pub fn keys(s: &'static str) -> &'static str {
-    if !cfg!(not(target_os = "macos")) { return s }
+    if mac() { return s }
     static CACHE: std::sync::Mutex<BTreeMap<&'static str, &'static str>> = std::sync::Mutex::new(BTreeMap::new());
     let mut cache = CACHE.lock().unwrap();
     cache.entry(s).or_insert_with(|| Box::leak(windows_keys(s).into_boxed_str()))
@@ -150,9 +178,9 @@ pub fn hint(action: &str, default: &'static str) -> &'static str {
     let mut cache = HINTS.lock().unwrap();
     if let Some(h) = cache.get(&key) { return h }
     let text = key.split(' ').map(|stroke| {
-        let Ok(k) = Keystroke::parse(stroke) else { return stroke.to_string() };
+        let Ok(k) = parse_key(stroke) else { return stroke.to_string() };
         let m = k.modifiers;
-        let names = if cfg!(not(target_os = "macos")) { [(m.control, "Ctrl"), (m.alt, "Alt"), (m.shift, "Shift"), (m.platform, if cfg!(target_os = "windows") { "Win" } else { "Super" })] } else { [(m.platform, "⌘"), (m.alt, "⌥"), (m.shift, "Shift"), (m.control, "Control")] };
+        let names = if !mac() { [(m.control, "Ctrl"), (m.alt, "Alt"), (m.shift, "Shift"), (m.platform, if cfg!(target_os = "windows") { "Win" } else { "Super" })] } else { [(m.platform, "⌘"), (m.alt, "⌥"), (m.shift, "Shift"), (m.control, "Control")] };
         let mut parts: Vec<String> = names.into_iter().filter(|(on, _)| *on).map(|(_, s)| s.to_string()).collect();
         parts.push(match k.key.as_str() { "space" => "Space".into(), "enter" => "Enter".into(), k if k.chars().count() == 1 => k.to_uppercase(), k => { let mut c = k.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() } });
         parts.join(" + ")
@@ -166,7 +194,7 @@ pub fn rebuild(cx: &mut App) {
     *CUSTOM.write().unwrap() = cx.global::<Shortcuts>().custom.clone();
     let s = cx.global::<Shortcuts>();
     let bindings: Vec<_> = s.base.iter().filter(|b| !s.custom.get(b.action().name()).is_some_and(|key| key.is_empty())).map(|b| {
-        s.custom.get(b.action().name()).and_then(|key| KeyBinding::load(key, b.action().boxed_clone(), b.predicate(), false, b.action_input(), &DummyKeyboardMapper).ok()).unwrap_or_else(|| b.clone())
+        s.custom.get(b.action().name()).and_then(|key| load(key, b)).unwrap_or_else(|| b.clone())
     }).collect();
     cx.clear_key_bindings(); cx.bind_keys(bindings);
 }
@@ -186,9 +214,11 @@ fn info(name: &str) -> Option<(usize, &'static str, &'static str)> {
         "OpenSettings" => (0, "打开设置", "Open Settings"),
         "GoHome" => (0, "返回主页", "Go to Home"),
         "ToggleSidebar" => (0, "展开 / 收起侧栏", "Show / hide sidebar"),
+        "ToggleDarkMode" => (0, "切换深色 / 浅色", "Toggle dark mode"),
         "FocusSearch" => (0, "搜索文档", "Search documents"),
         "ToggleShortcuts" => (0, "查看快捷键", "Show shortcuts"),
         "OpenFile" => (1, "打开 Markdown 文件", "Open Markdown file"),
+        "OpenFolder" => (1, "打开文件夹", "Open folder"),
         "ImportDoc" => (1, "导入文档", "Import documents"),
         "Save" => (1, "保存文档", "Save document"),
         "EditMode" => (1, "编辑模式", "Edit mode"),
@@ -242,7 +272,7 @@ fn default_key(s: &Shortcuts, id: &str) -> String {
     if id == "global" { return GLOBAL_DEFAULT.into(); }
     if id == LAST_ID { return LAST_DEFAULT.into(); }
     if id.ends_with("::NewDoc") { return if cfg!(not(target_os = "macos")) { "ctrl-n" } else { "cmd-n" }.into(); }
-    s.base.iter().find(|b| b.action().name() == id).map(|b| b.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" ")).unwrap_or_default()
+    s.base.iter().find(|b| b.action().name() == id).map(|b| b.keystrokes().iter().map(unparse).collect::<Vec<_>>().join(" ")).unwrap_or_default()
 }
 /// The key an action runs on now.
 pub fn key_of(cx: &App, id: &str) -> String {
@@ -252,10 +282,15 @@ pub fn key_of(cx: &App, id: &str) -> String {
 pub fn rows(cx: &App) -> Vec<(String, String, String)> {
     let Some(s) = cx.try_global::<Shortcuts>() else { return vec![] };
     let mut rows: Vec<(usize, String, String, String)> = vec![];
-    for b in &s.base {
-        let name = b.action().name();
+    // One row per action: the text fields (`input::`) and the board bind their own 复制, 全选…
+    // under the same names, so a title already listed by the editor or the app is skipped
+    // (theirs first, whatever order the keymap holds them in).
+    let mine = |n: &str| n.starts_with("editor::") || n.starts_with("workspace::");
+    let mut names: Vec<&str> = s.base.iter().map(|b| b.action().name()).collect();
+    names.sort_by_key(|n| !mine(n));
+    for name in names {
         if let Some(title) = label(name) {
-            if rows.iter().any(|(_, id, _, _)| id == name) { continue; }
+            if rows.iter().any(|(_, id, t, _)| id == name || t == title) { continue; }
             rows.push((info(name).unwrap().0, name.into(), title.into(), key_of(cx, name)));
         }
     }
@@ -266,10 +301,14 @@ pub fn rows(cx: &App) -> Vec<(String, String, String)> {
 }
 pub fn pretty(key: &str) -> String {
     if key.is_empty() { return tr("未设置", "Not set").into(); }
-    key.split(' ').map(|stroke| {
-        let Ok(ks) = Keystroke::parse(stroke) else { return stroke.to_string() };
+    strokes(key).into_iter().map(|parts| parts.join(if mac() { " " } else { "+" })).collect::<Vec<_>>().join("  →  ")
+}
+/// Each stroke of `key` as the names of its keys (⌘, ⇧, K …), one key cap each.
+pub fn strokes(key: &str) -> Vec<Vec<String>> {
+    key.split(' ').filter(|s| !s.is_empty()).map(|stroke| {
+        let Ok(ks) = parse_key(stroke) else { return vec![stroke.to_string()] };
         let m = ks.modifiers;
-        let win = cfg!(not(target_os = "macos"));
+        let win = !mac();
         let names = if win { [(m.control, "Ctrl"), (m.alt, "Alt"), (m.shift, "Shift"), (m.platform, if cfg!(target_os = "windows") { "Win" } else { "Super" })] } else { [(m.control, "⌃"), (m.alt, "⌥"), (m.shift, "⇧"), (m.platform, "⌘")] };
         let mut out: Vec<String> = names.into_iter().filter(|(on, _)| *on).map(|(_, s)| s.to_string()).collect();
         out.push(match ks.key.as_str() {
@@ -280,11 +319,11 @@ pub fn pretty(key: &str) -> String {
             k if k.chars().count() == 1 => k.to_uppercase(),
             k => { let mut c = k.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() }
         });
-        out.join(if win { "+" } else { " " })
-    }).collect::<Vec<_>>().join("  →  ")
+        out
+    }).collect()
 }
 fn sequence(key: &str) -> anyhow::Result<Vec<Keystroke>> {
-    key.split_whitespace().map(|k| Keystroke::parse(k).map_err(Into::into)).collect()
+    key.split_whitespace().map(|k| parse_key(k).map_err(Into::into)).collect()
 }
 fn overlaps(a: &[Keystroke], b: &[Keystroke]) -> bool {
     !a.is_empty() && !b.is_empty() && (a.starts_with(b) || b.starts_with(a))
@@ -297,7 +336,7 @@ fn conflicts(s: &Shortcuts, id: &str, key: &str) -> Vec<String> {
     for b in &s.base {
         let name = b.action().name();
         if name == id || found.iter().any(|n| n == name) { continue; }
-        let other = s.custom.get(name).cloned().unwrap_or_else(|| b.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" "));
+        let other = s.custom.get(name).cloned().unwrap_or_else(|| b.keystrokes().iter().map(unparse).collect::<Vec<_>>().join(" "));
         let same_context = contexts.contains(&b.predicate().map(|p| p.to_string()));
         if (label(name).is_some() || same_context || is_global(id)) && sequence(&other).is_ok_and(|other| overlaps(&parsed, &other)) {
             found.push(name.to_string());
@@ -339,10 +378,10 @@ pub(crate) fn set_global(key: &str, cx: &mut App) -> anyhow::Result<()> { change
 fn write(custom: &BTreeMap<String, String>) -> anyhow::Result<()> {
     use std::io::Write;
     let tmp = path().with_extension("json.tmp");
-    let mut f = std::fs::File::create(&tmp)?;
+    let mut f = fdl_core::vfs::File::create(&tmp)?;
     f.write_all(&serde_json::to_vec_pretty(custom)?)?;
     f.sync_all()?;
-    std::fs::rename(tmp, path())?;
+    fdl_core::vfs::rename(tmp, path())?;
     Ok(())
 }
 impl Workspace {
@@ -359,7 +398,7 @@ impl Workspace {
         self.shortcut_recording = Some(id.to_string());
         self.shortcut_error = None;
         crate::quick_note::suspend_hotkey();
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         cx.clear_key_bindings();
         cx.notify();
     }
@@ -420,7 +459,7 @@ impl Workspace {
             self.shortcut_error = Some((id, first_group_hint().into()));
         } else if self.shortcut_strokes.len() >= if is_global(&id) { 1 } else { 4 } {
             self.shortcut_error = Some((id, tr("已达到组合键上限，请保存或按退格修改", "Save or press Backspace to edit the sequence").into()));
-        } else { self.shortcut_strokes.push(ev.keystroke.unparse()); }
+        } else { self.shortcut_strokes.push(unparse(&ev.keystroke)); }
         cx.notify(); true
     }
 
@@ -445,8 +484,8 @@ impl Workspace {
         let customized = cx.try_global::<Shortcuts>().is_some_and(|s| s.custom.keys().any(|k| !is_global(k)));
         div().flex_none().flex().items_center().gap(px(8.))
             .when(customized, |d| d.child(crate::settings::link_button("shortcuts-reset-all", tr("全部恢复默认", "Reset all")).on_click(cx.listener(|w, _, _, cx| w.reset_all_shortcuts(cx)))))
-            .child(div().w(px(200.)).h(px(28.)).px(px(8.)).flex().items_center().gap(px(6.)).rounded(px(8.)).bg(Theme::fill_hover())
-                .child(crate::ui::icon("search", 14., Theme::icon()))
+            .child(crate::design::Field::new("shortcuts-search").sized(crate::design::FieldSize::Sm).w(px(200.))
+                .child(crate::design::icon("search", 14., crate::design::color::muted_foreground()))
                 .child(div().flex_1().min_w_0().child(self.settings_filter.clone())))
             .into_any_element()
     }
@@ -466,8 +505,7 @@ impl Workspace {
             groups[g].push(div().group("shortcut-row").w_full().px(px(16.)).py(px(7.)).flex().flex_col().gap(px(2.))
                 .child(div().w_full().min_h(px(28.)).flex().items_center().gap(px(12.))
                     .child(div().flex_1().min_w_0().text_size(px(13.)).line_height(px(20.)).child(title))
-                    .when(is_custom && !recording, |d| d.child(div().id(SharedString::from(format!("reset-{reset}"))).h(px(26.)).px(px(8.)).flex().items_center().rounded(px(7.)).cursor_pointer()
-                        .text_size(px(12.)).text_color(Theme::primary()).hover(|s| s.bg(Theme::fill_hover())).child(tr("恢复默认", "Reset"))
+                    .when(is_custom && !recording, |d| d.child(crate::settings::link_button(SharedString::from(format!("reset-{reset}")), tr("恢复默认", "Reset"))
                         .on_click(cx.listener(move |w, _, _, cx| w.reset_shortcut(&reset, cx)))))
                     .when(!recording && !key.is_empty(), |d| d.child(crate::settings::link_button(SharedString::from(format!("clear-{clear}")), tr("移除", "Remove")).invisible().group_hover("shortcut-row", |s| s.visible()).on_click(cx.listener(move |w, _, _, cx| w.clear_shortcut(&clear, cx)))))
                     .child(crate::settings::keycap(SharedString::from(id.clone()), &shown_key, recording)
@@ -490,7 +528,7 @@ impl Workspace {
         let show_global = cfg!(target_os = "macos") && (matches("快速新建笔记", "Quick note", &pretty(&global)) || matches("打开上次使用的文档", "Open last used document", &pretty(&last)));
         let empty = empty && !show_global;
         let global_group = div().w_full().flex().flex_col().gap(px(8.))
-            .child(crate::settings::group(Some(tr("全局", "Global")), vec![
+            .child(crate::settings::group("shortcuts-global", Some(tr("全局", "Global")), vec![
                 div().w_full().px(px(16.)).py(px(10.)).flex().items_center().gap(px(12.))
                     .child(div().flex_1().min_w_0().text_size(px(13.)).line_height(px(20.)).child(tr("快速新建笔记", "Quick note")))
                     .when(on && global != GLOBAL_DEFAULT && !global_rec, |d| d.child(crate::settings::link_button("global-reset", tr("恢复默认", "Reset")).on_click(cx.listener(|w, _, _, cx| w.reset_shortcut("global", cx)))))
@@ -507,17 +545,11 @@ impl Workspace {
             ]))
             .when(global_rec || last_rec, |d| d.child(self.shortcut_recorder(cx)))
             .children(global_err.map(|e| div().px(px(4.)).text_size(px(12.)).line_height(px(18.)).text_color(Theme::danger()).child(e)));
-        div().w_full().flex().flex_col().gap(px(28.))
+        div().w_full().flex().flex_col().gap(px(crate::design::geo().section_gap))
             .children(general_error.map(|e| div().px(px(4.)).text_size(px(12.)).line_height(px(18.)).text_color(Theme::danger()).child(e)))
             .when(show_global, |d| d.child(global_group))
             .when(empty, |d| d.child(div().py(px(40.)).flex().justify_center().text_size(px(13.)).text_color(Theme::text_caption()).child(tr("没有匹配的快捷键", "No matching shortcuts"))))
-            .children(groups.into_iter().enumerate().filter(|(_, rows)| !rows.is_empty()).map(|(g, rows)| {
-                let n = rows.len();
-                div().w_full().flex().flex_col().gap(px(8.))
-                    .child(div().px(px(4.)).text_size(px(13.)).line_height(px(18.)).font_weight(FontWeight::SEMIBOLD).text_color(Theme::sidebar_section()).child(tr(GROUPS[g].0, GROUPS[g].1)))
-                    .child(div().w_full().flex().flex_col().rounded(px(12.)).border_1().border_color(Theme::line_border()).overflow_hidden()
-                        .children(rows.into_iter().enumerate().map(move |(i, r)| div().w_full().flex().flex_col().when(i + 1 < n, |d| d.border_b_1().border_color(crate::ui::list_line())).child(r))))
-            }))
+            .children(groups.into_iter().enumerate().filter(|(_, rows)| !rows.is_empty()).map(|(g, rows)| crate::settings::group(("shortcuts-group", g), Some(tr(GROUPS[g].0, GROUPS[g].1)), rows)))
             .into_any_element()
     }
 }
@@ -539,6 +571,7 @@ mod key_text_tests {
         assert_eq!(w("⌘C / ⌘X / ⌘V"), "Ctrl+C / Ctrl+X / Ctrl+V");
         assert_eq!(w("⌘⇧← / ⌘⇧↓"), "Shift+Home / Ctrl+Shift+End");
         assert_eq!(w("按 ⌘ N 新建，⌘ ,"), "按 Ctrl+N 新建，Ctrl+,");
+        assert_eq!(w("Quick new (⌘N)"), "Quick new (Ctrl+N)");
         assert_eq!(w("On macOS, <code>⌘ ⌃ ⇧ 4</code>"), "On macOS, <code>⌘ ⌃ ⇧ 4</code>");
         assert_eq!(w("Shift + Tab and Control"), "Shift + Tab and Control");
     }
